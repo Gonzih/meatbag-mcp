@@ -1,15 +1,16 @@
 {
   "name": "@gonzih/meatbag-mcp",
-  "version": "1.0.0",
-  "description": "Human-in-the-loop MCP server via Telegram — lets Claude Code agents pause and ask a human for input",
-  "main": "dist/index.js",
+  "version": "1.1.0",
+  "description": "Human-in-the-loop MCP for Claude Code: central Telegram service + thin MCP clients. Multiple agents share one human channel without routing conflicts.",
+  "main": "dist/mcp.js",
   "bin": {
-    "meatbag-mcp": "./dist/index.js"
+    "meatbag-mcp": "dist/mcp.js",
+    "meatbag-service": "dist/service.js"
   },
   "scripts": {
     "build": "tsc",
-    "start": "node dist/index.js",
-    "dev": "ts-node src/index.ts"
+    "dev:mcp": "ts-node src/mcp.ts",
+    "dev:service": "ts-node src/service.ts"
   },
   "keywords": [
     "mcp",
