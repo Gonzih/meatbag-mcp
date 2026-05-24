@@ -1,10 +1,10 @@
 {
-  "name": "@gonzih/meetbag-mcp",
+  "name": "@gonzih/meatbag-mcp",
   "version": "1.0.0",
   "description": "Human-in-the-loop MCP server via Telegram — lets Claude Code agents pause and ask a human for input",
   "main": "dist/index.js",
   "bin": {
-    "meetbag-mcp": "./dist/index.js"
+    "meatbag-mcp": "./dist/index.js"
   },
   "scripts": {
     "build": "tsc",

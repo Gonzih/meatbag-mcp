@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * meetbag-mcp — Human-in-the-loop MCP server via Telegram
+ * meatbag-mcp — Human-in-the-loop MCP server via Telegram
  *
  * Exposes a single MCP tool: request_human_input
  * When called, sends a Telegram message and waits for the next reply.
@@ -19,19 +19,19 @@ import {
 
 // ── Config ──────────────────────────────────────────────────────────────────
 
-const BOT_TOKEN = process.env.MEETBAG_BOT_TOKEN;
-const CHAT_ID = process.env.MEETBAG_CHAT_ID;
+const BOT_TOKEN = process.env.MEATBAG_BOT_TOKEN;
+const CHAT_ID = process.env.MEATBAG_CHAT_ID;
 const DEFAULT_TIMEOUT = parseInt(
-  process.env.MEETBAG_TIMEOUT_SECONDS ?? "120",
+  process.env.MEATBAG_TIMEOUT_SECONDS ?? "120",
   10
 );
 
 if (!BOT_TOKEN) {
-  process.stderr.write("[meetbag-mcp] MEETBAG_BOT_TOKEN env var is required\n");
+  process.stderr.write("[meatbag-mcp] MEATBAG_BOT_TOKEN env var is required\n");
   process.exit(1);
 }
 if (!CHAT_ID) {
-  process.stderr.write("[meetbag-mcp] MEETBAG_CHAT_ID env var is required\n");
+  process.stderr.write("[meatbag-mcp] MEATBAG_CHAT_ID env var is required\n");
   process.exit(1);
 }
 
@@ -127,7 +127,7 @@ async function pollLoop(): Promise<void> {
       const errMsg = err instanceof Error ? err.message : String(err);
       // Ignore timeout errors from AbortSignal — they're expected
       if (!errMsg.includes("TimeoutError") && !errMsg.includes("AbortError")) {
-        process.stderr.write(`[meetbag-mcp] Polling error: ${errMsg}\n`);
+        process.stderr.write(`[meatbag-mcp] Polling error: ${errMsg}\n`);
       }
       // Brief back-off before retrying to avoid hammering the API
       await new Promise((r) => setTimeout(r, 1000));
@@ -165,7 +165,7 @@ async function requestHumanInput(
     pendingQueue.push({
       resolve: (answer: string) => resolve({ answer, timed_out: false }),
       reject: (err: Error) => {
-        process.stderr.write(`[meetbag-mcp] Request rejected: ${err.message}\n`);
+        process.stderr.write(`[meatbag-mcp] Request rejected: ${err.message}\n`);
         resolve({ answer: "", timed_out: true });
       },
       timeoutHandle,
@@ -179,7 +179,7 @@ async function requestHumanInput(
 // ── MCP Server ────────────────────────────────────────────────────────────────
 
 const server = new Server(
-  { name: "meetbag-mcp", version: "1.0.0" },
+  { name: "meatbag-mcp", version: "1.0.0" },
   { capabilities: { tools: {} } }
 );
 
@@ -257,10 +257,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  process.stderr.write("[meetbag-mcp] Server running on stdio\n");
+  process.stderr.write("[meatbag-mcp] Server running on stdio\n");
 }
 
 main().catch((err) => {
-  process.stderr.write(`[meetbag-mcp] Fatal: ${err instanceof Error ? err.message : String(err)}\n`);
+  process.stderr.write(`[meatbag-mcp] Fatal: ${err instanceof Error ? err.message : String(err)}\n`);
   process.exit(1);
 });
