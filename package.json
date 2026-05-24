@@ -1,0 +1,39 @@
+{
+  "name": "@gonzih/meetbag-mcp",
+  "version": "1.0.0",
+  "description": "Human-in-the-loop MCP server via Telegram — lets Claude Code agents pause and ask a human for input",
+  "main": "dist/index.js",
+  "bin": {
+    "meetbag-mcp": "./dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "ts-node src/index.ts"
+  },
+  "keywords": [
+    "mcp",
+    "telegram",
+    "human-in-the-loop",
+    "claude",
+    "ai-agent"
+  ],
+  "author": "gonzih",
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.29.0"
+  },
+  "devDependencies": {
+    "@types/node": "22.15.21",
+    "typescript": "5.8.3"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "files": [
+    "dist"
+  ],
+  "publishConfig": {
+    "access": "public"
+  }
+}
