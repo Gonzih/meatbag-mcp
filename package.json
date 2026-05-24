@@ -1,6 +1,6 @@
 {
   "name": "@gonzih/meatbag-mcp",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "description": "Human-in-the-loop MCP for Claude Code: central Telegram service + thin MCP clients. Multiple agents share one human channel without routing conflicts.",
   "main": "dist/mcp.js",
   "bin": {
