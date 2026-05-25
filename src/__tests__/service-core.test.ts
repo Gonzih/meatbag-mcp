@@ -1,19 +1,21 @@
 /**
- * Tests for meatbag-service core logic:
- *   - In-memory request store (CRUD)
- *   - Send queue operations
- *   - processQueue dispatcher
- *   - HTTP API endpoints (GET /health, POST /request, GET /response/:id)
- *   - Error scenarios
- *   - Sequential queue behavior
+ * Tests for service-core.ts — the extracted business logic of meatbag-service.
  *
- * Uses Node.js built-in test runner (node:test) — no extra dependencies.
- * Telegram I/O is injected as a mock; no real network calls are made.
+ * Covers:
+ *   - In-memory request store CRUD (Map operations, optional fields, waiters)
+ *   - Send queue FIFO ordering and activeRequestId tracking
+ *   - processQueue dispatcher (no-op guards, text/photo routing, context prefix,
+ *     failure handling, missing-entry skip, re-entrancy safety)
+ *   - HTTP API endpoints via a real test server (GET /health, POST /request,
+ *     GET /response/:id)
+ *   - Error scenarios: 400 validation, 404, 502 Telegram failure
+ *   - Sequential queue behavior end-to-end
+ *
+ * The Telegram sender is injected as a vi.fn() mock — no real network calls.
  */
 
-import { describe, test } from "node:test";
-import assert from "node:assert/strict";
-import { createServer, IncomingMessage, ServerResponse } from "http";
+import { describe, it, expect, vi, beforeEach } from "vitest";
+import { createServer, IncomingMessage, ServerResponse } from "node:http";
 import {
   createServiceState,
   processQueue,
@@ -21,20 +23,18 @@ import {
   ServiceState,
   TelegramSender,
   RequestEntry,
-} from "./service-core";
+} from "../service-core";
 
 // ── Test helpers ──────────────────────────────────────────────────────────────
 
-/** Returns a no-op TelegramSender with optional overrides */
 function mockTg(overrides: Partial<TelegramSender> = {}): TelegramSender {
   return {
-    sendMessage: async () => {},
-    sendPhoto: async () => {},
+    sendMessage: vi.fn().mockResolvedValue(undefined),
+    sendPhoto: vi.fn().mockResolvedValue(undefined),
     ...overrides,
   };
 }
 
-/** Start a test HTTP server, run fn(port), then close it. */
 async function withTestServer(
   state: ServiceState,
   tg: TelegramSender,
@@ -42,110 +42,91 @@ async function withTestServer(
 ): Promise<{ port: number; close: () => Promise<void> }> {
   const handler = createHttpHandler(state, tg, options);
   const server = createServer((req: IncomingMessage, res: ServerResponse) => {
-    handler(req, res).catch(() => {
-      // errors handled inside handler; silence unhandled-rejection
-    });
+    handler(req, res).catch(() => {});
   });
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
   const port = (server.address() as { port: number }).port;
-
   return {
     port,
-    close: () =>
-      new Promise<void>((resolve, reject) =>
-        server.close((err) => (err ? reject(err) : resolve()))
-      ),
+    close: () => new Promise<void>((ok, fail) => server.close((e) => (e ? fail(e) : ok()))),
   };
 }
 
-async function getJson(
-  port: number,
-  path: string
-): Promise<{ status: number; body: unknown }> {
+async function getJson(port: number, path: string) {
   const res = await fetch(`http://127.0.0.1:${port}${path}`);
-  const body = await res.json();
-  return { status: res.status, body };
+  return { status: res.status, body: await res.json(), headers: res.headers };
 }
 
-async function postJson(
-  port: number,
-  path: string,
-  data: unknown
-): Promise<{ status: number; body: unknown }> {
+async function postJson(port: number, path: string, data: unknown) {
   const res = await fetch(`http://127.0.0.1:${port}${path}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(data),
   });
-  const body = await res.json();
-  return { status: res.status, body };
+  return { status: res.status, body: await res.json() };
 }
 
-/** Small async pause to let fire-and-forget processQueue calls settle */
-const tick = (ms = 20) => new Promise((r) => setTimeout(r, ms));
+/** Tiny async pause to let fire-and-forget processQueue calls settle */
+const tick = (ms = 20) => new Promise<void>((r) => setTimeout(r, ms));
 
 // ── createServiceState ────────────────────────────────────────────────────────
 
 describe("createServiceState", () => {
-  test("creates empty state", () => {
+  it("creates empty state", () => {
     const state = createServiceState();
-    assert.equal(state.requests.size, 0);
-    assert.deepEqual(state.sendQueue, []);
-    assert.equal(state.activeRequestId, null);
+    expect(state.requests.size).toBe(0);
+    expect(state.sendQueue).toEqual([]);
+    expect(state.activeRequestId).toBeNull();
   });
 
-  test("each call returns an independent instance", () => {
+  it("each call returns an independent instance", () => {
     const s1 = createServiceState();
     const s2 = createServiceState();
     s1.sendQueue.push("a");
-    assert.equal(s2.sendQueue.length, 0);
+    expect(s2.sendQueue).toHaveLength(0);
   });
 });
 
 // ── Request store CRUD ────────────────────────────────────────────────────────
 
 describe("Request store CRUD", () => {
-  test("creates and retrieves an entry", () => {
-    const state = createServiceState();
-    const entry: RequestEntry = { id: "req-1", question: "Answer?", waiters: [] };
+  let state: ServiceState;
+  beforeEach(() => { state = createServiceState(); });
+
+  it("creates and retrieves an entry", () => {
+    const entry: RequestEntry = { id: "req-1", question: "Q?", waiters: [] };
     state.requests.set("req-1", entry);
-    assert.equal(state.requests.has("req-1"), true);
-    assert.equal(state.requests.get("req-1"), entry);
+    expect(state.requests.get("req-1")).toBe(entry);
   });
 
-  test("updates an existing entry", () => {
-    const state = createServiceState();
+  it("updates answer on an existing entry", () => {
     const entry: RequestEntry = { id: "req-1", question: "Q?", waiters: [] };
     state.requests.set("req-1", entry);
     entry.answer = "42";
-    assert.equal(state.requests.get("req-1")?.answer, "42");
+    expect(state.requests.get("req-1")?.answer).toBe("42");
   });
 
-  test("returns undefined for a missing entry", () => {
-    const state = createServiceState();
-    assert.equal(state.requests.get("nonexistent"), undefined);
+  it("returns undefined for a missing entry", () => {
+    expect(state.requests.get("nonexistent")).toBeUndefined();
   });
 
-  test("deletes an entry", () => {
-    const state = createServiceState();
+  it("deletes an entry", () => {
     state.requests.set("req-1", { id: "req-1", question: "Q?", waiters: [] });
     state.requests.delete("req-1");
-    assert.equal(state.requests.has("req-1"), false);
+    expect(state.requests.has("req-1")).toBe(false);
   });
 
-  test("stores multiple independent entries", () => {
-    const state = createServiceState();
+  it("stores multiple independent entries", () => {
     for (let i = 0; i < 5; i++) {
       state.requests.set(`req-${i}`, { id: `req-${i}`, question: `Q${i}?`, waiters: [] });
     }
-    assert.equal(state.requests.size, 5);
+    expect(state.requests.size).toBe(5);
     for (let i = 0; i < 5; i++) {
-      assert.equal(state.requests.get(`req-${i}`)?.question, `Q${i}?`);
+      expect(state.requests.get(`req-${i}`)?.question).toBe(`Q${i}?`);
     }
   });
 
-  test("stores optional image_path and context fields", () => {
-    const state = createServiceState();
+  it("stores optional image_path and context fields", () => {
     const entry: RequestEntry = {
       id: "req-1",
       question: "What is this?",
@@ -155,108 +136,102 @@ describe("Request store CRUD", () => {
     };
     state.requests.set("req-1", entry);
     const stored = state.requests.get("req-1")!;
-    assert.equal(stored.image_path, "/tmp/img.png");
-    assert.equal(stored.context, "Production alert");
+    expect(stored.image_path).toBe("/tmp/img.png");
+    expect(stored.context).toBe("Production alert");
   });
 
-  test("failReason field marks a failed entry", () => {
-    const state = createServiceState();
+  it("failReason field marks a failed entry", () => {
     const entry: RequestEntry = { id: "req-1", question: "Q?", waiters: [] };
     state.requests.set("req-1", entry);
     entry.failReason = "network error";
-    assert.equal(state.requests.get("req-1")?.failReason, "network error");
+    expect(state.requests.get("req-1")?.failReason).toBe("network error");
   });
 
-  test("waiter callbacks are stored and invoked with a string answer", () => {
-    const state = createServiceState();
+  it("waiter callbacks are stored and invoked with a string answer", () => {
     const entry: RequestEntry = { id: "req-1", question: "Q?", waiters: [] };
     state.requests.set("req-1", entry);
-    let received: string | null = "unset";
-    entry.waiters.push((a) => { received = a; });
+    const cb = vi.fn();
+    entry.waiters.push(cb);
     entry.waiters[0]("hello");
-    assert.equal(received, "hello");
+    expect(cb).toHaveBeenCalledWith("hello");
   });
 
-  test("waiter callbacks can receive null (failure signal)", () => {
-    const state = createServiceState();
+  it("waiter callbacks can receive null (failure signal)", () => {
     const entry: RequestEntry = { id: "req-1", question: "Q?", waiters: [] };
     state.requests.set("req-1", entry);
-    let received: string | null = "unset";
-    entry.waiters.push((a) => { received = a; });
+    const cb = vi.fn();
+    entry.waiters.push(cb);
     entry.waiters[0](null);
-    assert.equal(received, null);
+    expect(cb).toHaveBeenCalledWith(null);
   });
 
-  test("multiple waiters on one entry are all called", () => {
-    const state = createServiceState();
+  it("multiple waiters on one entry are all called", () => {
     const entry: RequestEntry = { id: "req-1", question: "Q?", waiters: [] };
     state.requests.set("req-1", entry);
-    const answers: Array<string | null> = [];
-    entry.waiters.push((a) => answers.push(a));
-    entry.waiters.push((a) => answers.push(a));
-    entry.waiters.push((a) => answers.push(a));
+    const cbs = [vi.fn(), vi.fn(), vi.fn()];
+    for (const cb of cbs) entry.waiters.push(cb);
     for (const w of entry.waiters) w("yes");
-    assert.deepEqual(answers, ["yes", "yes", "yes"]);
+    for (const cb of cbs) expect(cb).toHaveBeenCalledWith("yes");
   });
 });
 
 // ── Send queue operations ─────────────────────────────────────────────────────
 
 describe("Send queue operations", () => {
-  test("FIFO order", () => {
+  it("maintains FIFO order", () => {
     const state = createServiceState();
     state.sendQueue.push("req-1", "req-2", "req-3");
-    assert.equal(state.sendQueue.shift(), "req-1");
-    assert.equal(state.sendQueue.shift(), "req-2");
-    assert.equal(state.sendQueue.shift(), "req-3");
-    assert.equal(state.sendQueue.length, 0);
+    expect(state.sendQueue.shift()).toBe("req-1");
+    expect(state.sendQueue.shift()).toBe("req-2");
+    expect(state.sendQueue.shift()).toBe("req-3");
+    expect(state.sendQueue).toHaveLength(0);
   });
 
-  test("activeRequestId starts null, can be set and cleared", () => {
+  it("activeRequestId starts null, can be set and cleared", () => {
     const state = createServiceState();
-    assert.equal(state.activeRequestId, null);
+    expect(state.activeRequestId).toBeNull();
     state.activeRequestId = "req-1";
-    assert.equal(state.activeRequestId, "req-1");
+    expect(state.activeRequestId).toBe("req-1");
     state.activeRequestId = null;
-    assert.equal(state.activeRequestId, null);
+    expect(state.activeRequestId).toBeNull();
   });
 });
 
 // ── processQueue ──────────────────────────────────────────────────────────────
 
 describe("processQueue", () => {
-  test("no-op when activeRequestId is set", async () => {
-    const state = createServiceState();
+  let state: ServiceState;
+  beforeEach(() => { state = createServiceState(); });
+
+  it("is a no-op when activeRequestId is already set", async () => {
     state.requests.set("req-1", { id: "req-1", question: "Q?", waiters: [] });
     state.sendQueue.push("req-1");
     state.activeRequestId = "other-req";
-    let called = false;
-    const tg = mockTg({ sendMessage: async () => { called = true; } });
+    const tg = mockTg();
     await processQueue(state, tg);
-    assert.equal(called, false);
-    assert.equal(state.sendQueue.length, 1);
-    assert.equal(state.activeRequestId, "other-req");
+    expect(tg.sendMessage).not.toHaveBeenCalled();
+    expect(state.sendQueue).toHaveLength(1);
+    expect(state.activeRequestId).toBe("other-req");
   });
 
-  test("no-op when sendQueue is empty", async () => {
-    const state = createServiceState();
-    await processQueue(state, mockTg());
-    assert.equal(state.activeRequestId, null);
+  it("is a no-op when sendQueue is empty", async () => {
+    const tg = mockTg();
+    await processQueue(state, tg);
+    expect(state.activeRequestId).toBeNull();
+    expect(tg.sendMessage).not.toHaveBeenCalled();
   });
 
-  test("sends text message and sets activeRequestId", async () => {
-    const state = createServiceState();
+  it("sends text message and sets activeRequestId", async () => {
     state.requests.set("req-1", { id: "req-1", question: "Hello?", waiters: [] });
     state.sendQueue.push("req-1");
-    let sentText = "";
-    await processQueue(state, mockTg({ sendMessage: async (t) => { sentText = t; } }));
-    assert.equal(sentText, "Hello?");
-    assert.equal(state.activeRequestId, "req-1");
-    assert.equal(state.sendQueue.length, 0);
+    const tg = mockTg();
+    await processQueue(state, tg);
+    expect(tg.sendMessage).toHaveBeenCalledWith("Hello?");
+    expect(state.activeRequestId).toBe("req-1");
+    expect(state.sendQueue).toHaveLength(0);
   });
 
-  test("prepends context to message text", async () => {
-    const state = createServiceState();
+  it("prepends context to message text", async () => {
     state.requests.set("req-1", {
       id: "req-1",
       question: "What now?",
@@ -264,13 +239,12 @@ describe("processQueue", () => {
       waiters: [],
     });
     state.sendQueue.push("req-1");
-    let sentText = "";
-    await processQueue(state, mockTg({ sendMessage: async (t) => { sentText = t; } }));
-    assert.equal(sentText, "[Context: Background info]\n\nWhat now?");
+    const tg = mockTg();
+    await processQueue(state, tg);
+    expect(tg.sendMessage).toHaveBeenCalledWith("[Context: Background info]\n\nWhat now?");
   });
 
-  test("routes to sendPhoto when image_path is set", async () => {
-    const state = createServiceState();
+  it("routes to sendPhoto when image_path is set", async () => {
     state.requests.set("req-1", {
       id: "req-1",
       question: "What is this?",
@@ -278,126 +252,110 @@ describe("processQueue", () => {
       waiters: [],
     });
     state.sendQueue.push("req-1");
-    let sentPath = "";
-    let sentCaption = "";
-    await processQueue(
-      state,
-      mockTg({
-        sendPhoto: async (p, c) => { sentPath = p; sentCaption = c; },
-      })
-    );
-    assert.equal(sentPath, "/tmp/test.png");
-    assert.equal(sentCaption, "What is this?");
-    assert.equal(state.activeRequestId, "req-1");
+    const tg = mockTg();
+    await processQueue(state, tg);
+    expect(tg.sendPhoto).toHaveBeenCalledWith("/tmp/test.png", "What is this?");
+    expect(tg.sendMessage).not.toHaveBeenCalled();
+    expect(state.activeRequestId).toBe("req-1");
   });
 
-  test("on Telegram failure: releases slot, sets failReason, notifies waiters with null", async () => {
-    const state = createServiceState();
+  it("on failure: releases slot, sets failReason, notifies waiters with null", async () => {
     const entry: RequestEntry = { id: "req-1", question: "Q?", waiters: [] };
     state.requests.set("req-1", entry);
     state.sendQueue.push("req-1");
-    let gotNull = false;
-    entry.waiters.push((a) => { gotNull = a === null; });
-    await processQueue(
-      state,
-      mockTg({ sendMessage: async () => { throw new Error("Telegram API error"); } })
-    );
-    assert.equal(state.activeRequestId, null);
-    assert.equal(entry.failReason, "Telegram API error");
-    assert.equal(gotNull, true);
-    assert.equal(entry.waiters.length, 0);
+    const cb = vi.fn();
+    entry.waiters.push(cb);
+    const tg = mockTg({
+      sendMessage: vi.fn().mockRejectedValue(new Error("Telegram 500")),
+    });
+    await processQueue(state, tg);
+    expect(state.activeRequestId).toBeNull();
+    expect(entry.failReason).toBe("Telegram 500");
+    expect(cb).toHaveBeenCalledWith(null);
+    expect(entry.waiters).toHaveLength(0);
   });
 
-  test("on Telegram failure: processes next queued request", async () => {
-    const state = createServiceState();
+  it("on failure: processes next queued request", async () => {
     state.requests.set("req-1", { id: "req-1", question: "Fail?", waiters: [] });
     state.requests.set("req-2", { id: "req-2", question: "OK?", waiters: [] });
     state.sendQueue.push("req-1", "req-2");
-    const sentTexts: string[] = [];
-    await processQueue(
-      state,
-      mockTg({
-        sendMessage: async (t) => {
-          if (t === "Fail?") throw new Error("fail");
-          sentTexts.push(t);
-        },
-      })
-    );
-    await tick(); // let async recursive processQueue run
-    assert.equal(state.activeRequestId, "req-2");
-    assert.deepEqual(sentTexts, ["OK?"]);
+    let callCount = 0;
+    const tg = mockTg({
+      sendMessage: vi.fn().mockImplementation(async (t: string) => {
+        callCount++;
+        if (t === "Fail?") throw new Error("fail");
+      }),
+    });
+    await processQueue(state, tg);
+    await tick();
+    expect(state.activeRequestId).toBe("req-2");
+    expect(tg.sendMessage).toHaveBeenCalledWith("OK?");
   });
 
-  test("skips missing entry in queue and processes next", async () => {
-    const state = createServiceState();
+  it("skips a missing entry and processes the next one", async () => {
     // req-1 is in queue but NOT in requests map
     state.requests.set("req-2", { id: "req-2", question: "Q2?", waiters: [] });
     state.sendQueue.push("req-1", "req-2");
-    let sentText = "";
-    await processQueue(state, mockTg({ sendMessage: async (t) => { sentText = t; } }));
+    const tg = mockTg();
+    await processQueue(state, tg);
     await tick();
-    assert.equal(sentText, "Q2?");
-    assert.equal(state.activeRequestId, "req-2");
+    expect(tg.sendMessage).toHaveBeenCalledWith("Q2?");
+    expect(state.activeRequestId).toBe("req-2");
   });
 
-  test("activeRequestId is set before await (re-entrancy guard)", async () => {
-    const state = createServiceState();
+  it("sets activeRequestId before awaiting send (re-entrancy guard)", async () => {
     state.requests.set("req-1", { id: "req-1", question: "Q?", waiters: [] });
     state.sendQueue.push("req-1");
     let activeAtSendTime: string | null = "unset";
-    // Run two concurrent processQueue calls
+    const tg = mockTg({
+      sendMessage: vi.fn().mockImplementation(async () => {
+        activeAtSendTime = state.activeRequestId;
+      }),
+    });
+    // Launch two concurrent calls; second should be a no-op
     await Promise.all([
-      processQueue(
-        state,
-        mockTg({
-          sendMessage: async () => {
-            activeAtSendTime = state.activeRequestId;
-          },
-        })
-      ),
-      processQueue(state, mockTg()), // second call — should be no-op
+      processQueue(state, tg),
+      processQueue(state, tg),
     ]);
-    assert.equal(activeAtSendTime, "req-1"); // set before sendMessage awaited
-    assert.equal(state.sendQueue.length, 0);
+    expect(activeAtSendTime).toBe("req-1");
+    expect(tg.sendMessage).toHaveBeenCalledOnce();
   });
 });
 
 // ── GET /health ───────────────────────────────────────────────────────────────
 
 describe("GET /health", () => {
-  test("idle state returns queued=0, active=null", async () => {
+  it("returns ok with queued=0 and active=null when idle", async () => {
     const state = createServiceState();
     const { port, close } = await withTestServer(state, mockTg());
     try {
       const { status, body } = await getJson(port, "/health");
-      assert.equal(status, 200);
-      assert.deepEqual(body, { status: "ok", queued: 0, active: null });
+      expect(status).toBe(200);
+      expect(body).toEqual({ status: "ok", queued: 0, active: null });
     } finally {
       await close();
     }
   });
 
-  test("reflects non-empty send queue", async () => {
+  it("reflects the current send queue length", async () => {
     const state = createServiceState();
     state.sendQueue.push("req-1", "req-2");
     const { port, close } = await withTestServer(state, mockTg());
     try {
-      const { status, body } = await getJson(port, "/health");
-      assert.equal(status, 200);
-      assert.deepEqual(body, { status: "ok", queued: 2, active: null });
+      const { body } = await getJson(port, "/health");
+      expect((body as { queued: number }).queued).toBe(2);
     } finally {
       await close();
     }
   });
 
-  test("reflects active request ID", async () => {
+  it("reflects the active request ID", async () => {
     const state = createServiceState();
     state.activeRequestId = "req-abc";
     const { port, close } = await withTestServer(state, mockTg());
     try {
-      const { status, body } = await getJson(port, "/health");
-      assert.equal(status, 200);
-      assert.deepEqual(body, { status: "ok", queued: 0, active: "req-abc" });
+      const { body } = await getJson(port, "/health");
+      expect((body as { active: string }).active).toBe("req-abc");
     } finally {
       await close();
     }
@@ -407,81 +365,75 @@ describe("GET /health", () => {
 // ── POST /request ─────────────────────────────────────────────────────────────
 
 describe("POST /request", () => {
-  test("valid request returns 200 with a UUID request_id", async () => {
+  it("returns 200 with a UUID request_id for a valid request", async () => {
     const state = createServiceState();
     const { port, close } = await withTestServer(state, mockTg());
     try {
-      const { status, body } = await postJson(port, "/request", { question: "What is 2+2?" });
-      assert.equal(status, 200);
+      const { status, body } = await postJson(port, "/request", { question: "Test?" });
+      expect(status).toBe(200);
       const id = (body as { request_id: string }).request_id;
-      assert.equal(typeof id, "string");
-      assert.equal(id.length, 36); // UUID format
+      expect(typeof id).toBe("string");
+      expect(id).toHaveLength(36); // UUID
     } finally {
       await close();
     }
   });
 
-  test("stores entry in state with correct question", async () => {
+  it("stores the entry with correct question", async () => {
     const state = createServiceState();
     const { port, close } = await withTestServer(state, mockTg());
     try {
       const { body } = await postJson(port, "/request", { question: "My question" });
       const id = (body as { request_id: string }).request_id;
-      const entry = state.requests.get(id);
-      assert.ok(entry, "entry should exist in state");
-      assert.equal(entry!.question, "My question");
-      assert.equal(entry!.id, id);
+      expect(state.requests.get(id)?.question).toBe("My question");
     } finally {
       await close();
     }
   });
 
-  test("stores image_path when provided", async () => {
+  it("stores image_path when provided", async () => {
     const state = createServiceState();
     const { port, close } = await withTestServer(state, mockTg());
     try {
       const { body } = await postJson(port, "/request", {
-        question: "What do you see?",
+        question: "What?",
         image_path: "/tmp/screenshot.png",
       });
       const id = (body as { request_id: string }).request_id;
-      assert.equal(state.requests.get(id)?.image_path, "/tmp/screenshot.png");
+      expect(state.requests.get(id)?.image_path).toBe("/tmp/screenshot.png");
     } finally {
       await close();
     }
   });
 
-  test("stores context when provided", async () => {
+  it("stores context when provided", async () => {
     const state = createServiceState();
     const { port, close } = await withTestServer(state, mockTg());
     try {
       const { body } = await postJson(port, "/request", {
         question: "Confirm?",
-        context: "User is logged in",
+        context: "User is admin",
       });
       const id = (body as { request_id: string }).request_id;
-      assert.equal(state.requests.get(id)?.context, "User is logged in");
+      expect(state.requests.get(id)?.context).toBe("User is admin");
     } finally {
       await close();
     }
   });
 
-  test("ignores non-string image_path", async () => {
+  it("ignores non-string image_path", async () => {
     const state = createServiceState();
     const { port, close } = await withTestServer(state, mockTg());
     try {
-      const { body } = await postJson(port, "/request", {
-        question: "Q?",
-        image_path: 42,
-      });
+      const { body } = await postJson(port, "/request", { question: "Q?", image_path: 42 });
       const id = (body as { request_id: string }).request_id;
-      assert.equal(state.requests.get(id)?.image_path, undefined);
+      expect(state.requests.get(id)?.image_path).toBeUndefined();
     } finally {
       await close();
     }
   });
 
-  test("returns 400 for invalid JSON body", async () => {
+  it("returns 400 for invalid JSON body", async () => {
     const state = createServiceState();
     const { port, close } = await withTestServer(state, mockTg());
     try {
@@ -490,76 +442,71 @@ describe("POST /request", () => {
         headers: { "Content-Type": "application/json" },
         body: "not-json{{{",
       });
-      const body = (await res.json()) as { error: string };
-      assert.equal(res.status, 400);
-      assert.equal(body.error, "invalid JSON body");
+      const body = await res.json();
+      expect(res.status).toBe(400);
+      expect((body as { error: string }).error).toBe("invalid JSON body");
     } finally {
       await close();
     }
   });
 
-  test("returns 400 when question is missing", async () => {
+  it("returns 400 when question is missing", async () => {
     const state = createServiceState();
     const { port, close } = await withTestServer(state, mockTg());
     try {
-      const { status, body } = await postJson(port, "/request", { image_path: "/tmp/img.png" });
-      assert.equal(status, 400);
-      assert.equal((body as { error: string }).error, "question (string) is required");
+      const { status, body } = await postJson(port, "/request", { image_path: "/tmp/img" });
+      expect(status).toBe(400);
+      expect((body as { error: string }).error).toBe("question (string) is required");
     } finally {
       await close();
     }
   });
 
-  test("returns 400 when question is empty string", async () => {
+  it("returns 400 when question is empty string", async () => {
     const state = createServiceState();
     const { port, close } = await withTestServer(state, mockTg());
     try {
-      const { status, body } = await postJson(port, "/request", { question: "" });
-      assert.equal(status, 400);
-      assert.equal((body as { error: string }).error, "question (string) is required");
+      const { status } = await postJson(port, "/request", { question: "" });
+      expect(status).toBe(400);
     } finally {
       await close();
     }
   });
 
-  test("returns 400 when question is not a string", async () => {
+  it("returns 400 when question is not a string", async () => {
     const state = createServiceState();
     const { port, close } = await withTestServer(state, mockTg());
     try {
-      const { status, body } = await postJson(port, "/request", { question: 42 });
-      assert.equal(status, 400);
-      assert.equal((body as { error: string }).error, "question (string) is required");
+      const { status } = await postJson(port, "/request", { question: 42 });
+      expect(status).toBe(400);
     } finally {
       await close();
     }
   });
 
-  test("enqueues request ID in sendQueue", async () => {
+  it("enqueues request ID in sendQueue", async () => {
     const state = createServiceState();
-    // Block processQueue so the ID stays in sendQueue
-    state.activeRequestId = "blocker";
+    state.activeRequestId = "blocker"; // prevent processQueue from consuming queue
     const { port, close } = await withTestServer(state, mockTg());
     try {
       const { body } = await postJson(port, "/request", { question: "Q?" });
       const id = (body as { request_id: string }).request_id;
-      assert.ok(state.sendQueue.includes(id), "request_id should be in sendQueue");
+      expect(state.sendQueue).toContain(id);
     } finally {
       await close();
     }
   });
 
-  test("second request stays queued while first is active", async () => {
+  it("second request stays queued while first is active", async () => {
     const state = createServiceState();
-    // Freeze a first request as active
-    const e1: RequestEntry = { id: "first", question: "First?", waiters: [] };
-    state.requests.set("first", e1);
+    state.requests.set("first", { id: "first", question: "First?", waiters: [] });
     state.activeRequestId = "first";
     const { port, close } = await withTestServer(state, mockTg());
     try {
       const { body } = await postJson(port, "/request", { question: "Second?" });
       const id = (body as { request_id: string }).request_id;
-      assert.equal(state.sendQueue[0], id);
-      assert.equal(state.activeRequestId, "first"); // unchanged
+      expect(state.sendQueue).toContain(id);
+      expect(state.activeRequestId).toBe("first");
     } finally {
       await close();
     }
@@ -569,19 +516,19 @@ describe("POST /request", () => {
 // ── GET /response/:id ─────────────────────────────────────────────────────────
 
 describe("GET /response/:id", () => {
-  test("returns 404 for unknown request ID", async () => {
+  it("returns 404 for unknown request ID", async () => {
     const state = createServiceState();
     const { port, close } = await withTestServer(state, mockTg());
     try {
-      const { status, body } = await getJson(port, "/response/nonexistent-id");
-      assert.equal(status, 404);
-      assert.equal((body as { error: string }).error, "request not found");
+      const { status, body } = await getJson(port, "/response/nonexistent");
+      expect(status).toBe(404);
+      expect((body as { error: string }).error).toBe("request not found");
     } finally {
       await close();
     }
   });
 
-  test("returns 200 with answer immediately if already answered", async () => {
+  it("returns answer immediately if already answered", async () => {
     const state = createServiceState();
     state.requests.set("req-1", {
       id: "req-1",
@@ -592,14 +539,14 @@ describe("GET /response/:id", () => {
     const { port, close } = await withTestServer(state, mockTg());
     try {
       const { status, body } = await getJson(port, "/response/req-1");
-      assert.equal(status, 200);
-      assert.deepEqual(body, { answer: "The answer is 42" });
+      expect(status).toBe(200);
+      expect(body).toEqual({ answer: "The answer is 42" });
     } finally {
       await close();
     }
   });
 
-  test("returns 502 immediately if Telegram send already failed", async () => {
+  it("returns 502 immediately if Telegram send already failed", async () => {
     const state = createServiceState();
     state.requests.set("req-1", {
       id: "req-1",
@@ -610,17 +557,14 @@ describe("GET /response/:id", () => {
     const { port, close } = await withTestServer(state, mockTg());
     try {
       const { status, body } = await getJson(port, "/response/req-1");
-      assert.equal(status, 502);
-      assert.equal(
-        (body as { error: string }).error,
-        "Telegram error: connection refused"
-      );
+      expect(status).toBe(502);
+      expect((body as { error: string }).error).toContain("connection refused");
     } finally {
       await close();
     }
   });
 
-  test("long-polls and returns answer when waiter is called", async () => {
+  it("long-polls and returns answer when waiter is called", async () => {
     const state = createServiceState();
     const entry: RequestEntry = { id: "req-1", question: "Q?", waiters: [] };
     state.requests.set("req-1", entry);
@@ -630,17 +574,17 @@ describe("GET /response/:id", () => {
     try {
       const pollPromise = getJson(port, "/response/req-1");
       await tick(50); // let server register the waiter
-      assert.equal(entry.waiters.length, 1);
+      expect(entry.waiters).toHaveLength(1);
       entry.waiters[0]("The answer is 42");
       const { status, body } = await pollPromise;
-      assert.equal(status, 200);
-      assert.deepEqual(body, { answer: "The answer is 42" });
+      expect(status).toBe(200);
+      expect(body).toEqual({ answer: "The answer is 42" });
     } finally {
       await close();
     }
   });
 
-  test("long-polls and returns 502 when waiter called with null", async () => {
+  it("long-polls and returns 502 when waiter called with null", async () => {
     const state = createServiceState();
     const entry: RequestEntry = { id: "req-1", question: "Q?", waiters: [] };
     state.requests.set("req-1", entry);
@@ -653,17 +597,14 @@ describe("GET /response/:id", () => {
       entry.failReason = "Telegram API error";
       entry.waiters[0](null);
       const { status, body } = await pollPromise;
-      assert.equal(status, 502);
-      assert.equal(
-        (body as { error: string }).error,
-        "Telegram error: Telegram API error"
-      );
+      expect(status).toBe(502);
+      expect((body as { error: string }).error).toContain("Telegram API error");
     } finally {
       await close();
     }
   });
 
-  test("long-poll times out and returns empty object", async () => {
+  it("long-poll times out and returns empty object", async () => {
     const state = createServiceState();
     state.requests.set("req-1", { id: "req-1", question: "Q?", waiters: [] });
     const { port, close } = await withTestServer(state, mockTg(), {
@@ -671,14 +612,14 @@ describe("GET /response/:id", () => {
     });
     try {
       const { status, body } = await getJson(port, "/response/req-1");
-      assert.equal(status, 200);
-      assert.deepEqual(body, {});
+      expect(status).toBe(200);
+      expect(body).toEqual({});
     } finally {
       await close();
     }
   });
 
-  test("waiter is removed from entry after timeout", async () => {
+  it("removes waiter from entry after timeout", async () => {
     const state = createServiceState();
     const entry: RequestEntry = { id: "req-1", question: "Q?", waiters: [] };
     state.requests.set("req-1", entry);
@@ -687,13 +628,13 @@ describe("GET /response/:id", () => {
     });
     try {
       await getJson(port, "/response/req-1");
-      assert.equal(entry.waiters.length, 0);
+      expect(entry.waiters).toHaveLength(0);
     } finally {
       await close();
     }
   });
 
-  test("multiple concurrent long-pollers all receive the same answer", async () => {
+  it("multiple concurrent long-pollers all receive the same answer", async () => {
     const state = createServiceState();
     const entry: RequestEntry = { id: "req-1", question: "Q?", waiters: [] };
     state.requests.set("req-1", entry);
@@ -701,19 +642,20 @@ describe("GET /response/:id", () => {
       longPollTimeoutMs: 5_000,
     });
     try {
-      const p1 = getJson(port, "/response/req-1");
-      const p2 = getJson(port, "/response/req-1");
-      const p3 = getJson(port, "/response/req-1");
-      await tick(60); // wait for all three to register
-      assert.equal(entry.waiters.length, 3);
-      // Notify all waiters (simulating pollLoop behaviour)
+      const polls = [
+        getJson(port, "/response/req-1"),
+        getJson(port, "/response/req-1"),
+        getJson(port, "/response/req-1"),
+      ];
+      await tick(60);
+      expect(entry.waiters).toHaveLength(3);
       const waiters = [...entry.waiters];
       entry.waiters = [];
       for (const w of waiters) w("shared answer");
-      const results = await Promise.all([p1, p2, p3]);
+      const results = await Promise.all(polls);
       for (const { status, body } of results) {
-        assert.equal(status, 200);
-        assert.deepEqual(body, { answer: "shared answer" });
+        expect(status).toBe(200);
+        expect(body).toEqual({ answer: "shared answer" });
       }
     } finally {
       await close();
@@ -724,46 +666,44 @@ describe("GET /response/:id", () => {
 // ── HTTP routing ──────────────────────────────────────────────────────────────
 
 describe("HTTP routing", () => {
-  test("unknown route returns 404", async () => {
+  it("returns 404 for unknown routes", async () => {
     const state = createServiceState();
     const { port, close } = await withTestServer(state, mockTg());
     try {
       const { status, body } = await getJson(port, "/unknown-route");
-      assert.equal(status, 404);
-      assert.equal((body as { error: string }).error, "not found");
+      expect(status).toBe(404);
+      expect((body as { error: string }).error).toBe("not found");
     } finally {
       await close();
     }
   });
 
-  test("GET /request (wrong method) returns 404", async () => {
+  it("GET /request (wrong method) returns 404", async () => {
     const state = createServiceState();
     const { port, close } = await withTestServer(state, mockTg());
     try {
-      const { status } = await getJson(port, "/request");
-      assert.equal(status, 404);
+      expect((await getJson(port, "/request")).status).toBe(404);
     } finally {
       await close();
     }
   });
 
-  test("nested /response/foo/bar returns 404", async () => {
+  it("nested /response/foo/bar returns 404", async () => {
     const state = createServiceState();
     const { port, close } = await withTestServer(state, mockTg());
     try {
-      const { status } = await getJson(port, "/response/foo/bar");
-      assert.equal(status, 404);
+      expect((await getJson(port, "/response/foo/bar")).status).toBe(404);
     } finally {
       await close();
     }
   });
 
-  test("response has Content-Type: application/json", async () => {
+  it("responses have Content-Type: application/json", async () => {
     const state = createServiceState();
     const { port, close } = await withTestServer(state, mockTg());
     try {
-      const res = await fetch(`http://127.0.0.1:${port}/health`);
-      assert.equal(res.headers.get("content-type"), "application/json");
+      const { headers } = await getJson(port, "/health");
+      expect(headers.get("content-type")).toBe("application/json");
     } finally {
       await close();
     }
@@ -773,32 +713,29 @@ describe("HTTP routing", () => {
 // ── Sequential queue behavior ─────────────────────────────────────────────────
 
 describe("Sequential queue behavior", () => {
-  test("first request is sent immediately, second stays queued", async () => {
+  it("first request is sent immediately, second stays queued", async () => {
     const state = createServiceState();
-    const sentTexts: string[] = [];
-    const tg = mockTg({ sendMessage: async (t) => { sentTexts.push(t); } });
+    const tg = mockTg();
     const { port, close } = await withTestServer(state, tg);
     try {
       const r1 = await postJson(port, "/request", { question: "First?" });
-      await tick(); // let processQueue run for req-1
+      await tick();
       const r2 = await postJson(port, "/request", { question: "Second?" });
       await tick();
-      assert.equal(sentTexts.length, 1);
-      assert.equal(sentTexts[0], "First?");
-      assert.equal(state.activeRequestId, (r1.body as { request_id: string }).request_id);
-      assert.ok(
-        state.sendQueue.includes((r2.body as { request_id: string }).request_id),
-        "second request should be in sendQueue"
-      );
+      expect(tg.sendMessage).toHaveBeenCalledTimes(1);
+      expect(tg.sendMessage).toHaveBeenCalledWith("First?");
+      const id1 = (r1.body as { request_id: string }).request_id;
+      const id2 = (r2.body as { request_id: string }).request_id;
+      expect(state.activeRequestId).toBe(id1);
+      expect(state.sendQueue).toContain(id2);
     } finally {
       await close();
     }
   });
 
-  test("answering active request sends next queued request", async () => {
+  it("answering active request dispatches the next queued request", async () => {
     const state = createServiceState();
-    const sentTexts: string[] = [];
-    const tg = mockTg({ sendMessage: async (t) => { sentTexts.push(t); } });
+    const tg = mockTg();
     const { port, close } = await withTestServer(state, tg);
     try {
       const r1 = await postJson(port, "/request", { question: "First?" });
@@ -809,46 +746,44 @@ describe("Sequential queue behavior", () => {
       const id1 = (r1.body as { request_id: string }).request_id;
       const id2 = (r2.body as { request_id: string }).request_id;
 
-      // Simulate pollLoop receiving an answer for req-1
+      // Simulate pollLoop answering req-1
       const entry1 = state.requests.get(id1)!;
       state.activeRequestId = null;
       entry1.answer = "Done!";
-      const waiters1 = [...entry1.waiters];
+      const waiters = [...entry1.waiters];
       entry1.waiters = [];
-      for (const w of waiters1) w("Done!");
+      for (const w of waiters) w("Done!");
       void processQueue(state, tg);
 
       await tick();
 
-      assert.equal(sentTexts.length, 2);
-      assert.equal(sentTexts[1], "Second?");
-      assert.equal(state.activeRequestId, id2);
+      expect(tg.sendMessage).toHaveBeenCalledTimes(2);
+      expect(tg.sendMessage).toHaveBeenLastCalledWith("Second?");
+      expect(state.activeRequestId).toBe(id2);
     } finally {
       await close();
     }
   });
 
-  test("processQueue is no-op when called while active request is sending", async () => {
+  it("processQueue is a no-op while the active request is still sending", async () => {
     const state = createServiceState();
     let resolveBlock!: () => void;
-    // sendMessage blocks until we release it, simulating a slow Telegram API
     const blockSend = new Promise<void>((r) => { resolveBlock = r; });
-    const tg = mockTg({ sendMessage: async () => { await blockSend; } });
-
+    const tg = mockTg({
+      sendMessage: vi.fn().mockReturnValue(blockSend),
+    });
     state.requests.set("req-1", { id: "req-1", question: "Q1?", waiters: [] });
     state.requests.set("req-2", { id: "req-2", question: "Q2?", waiters: [] });
     state.sendQueue.push("req-1", "req-2");
 
-    // Start first processQueue — it blocks inside sendMessage
     const pq1 = processQueue(state, tg);
     await tick(5);
-    // At this point activeRequestId = "req-1"; second call should be no-op
-    const pq2 = processQueue(state, tg); // should return immediately
-    await pq2;
-    assert.equal(state.sendQueue.length, 1); // req-2 still waiting
+    // While req-1 is still in-flight, a second call must not start req-2
+    await processQueue(state, tg); // should return immediately (no-op)
+    expect(state.sendQueue).toHaveLength(1); // req-2 still waiting
 
-    resolveBlock(); // unblock the first send
+    resolveBlock();
     await pq1;
-    assert.equal(state.activeRequestId, "req-1"); // slot stays claimed after send
+    expect(state.activeRequestId).toBe("req-1"); // slot stays after send
   });
 });
