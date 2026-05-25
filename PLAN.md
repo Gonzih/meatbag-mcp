@@ -1,51 +1,44 @@
-# PLAN: sequential question queue in meatbag-service
+# PLAN: Coverage Audit & Gap Analysis
 
 ## Task Restatement
-Modify `service.ts` so that only one Telegram message is visible (unanswered) at a time.
-When a second `POST /request` arrives while the first is still awaiting a reply, defer
-sending the second Telegram message until the first is answered. Queue drains FIFO.
-`mcp.ts` and the HTTP API surface must not change.
+Audit the entire codebase, set up a test framework with coverage instrumentation,
+write a representative test suite for both `src/service.ts` and `src/mcp.ts`,
+run coverage analysis, and produce a structured coverage gap analysis document.
 
-## Current Behavior
-- `POST /request` sends Telegram message immediately and pushes to `pendingQueue`
-- Multiple requests → multiple visible Telegram questions simultaneously
-- User has no idea which question their reply addresses
+## Codebase Summary (2 source files, no existing tests)
+- `src/service.ts` (369 LOC) — HTTP daemon + Telegram bot polling, sequential queue
+- `src/mcp.ts` (186 LOC) — Thin MCP client delegating to service
 
-## Required Behavior
-- Only the "active" request is visible in Telegram at any time
-- New requests enqueue in `sendQueue`; Telegram message is deferred until active slot is free
-- On Telegram reply → mark active answered, pop next from `sendQueue`, send it
+Neither file exports anything; both run top-level side-effects on import.
 
-## Approach
+## Approach Comparison
 
-### A: Single active slot + send queue (chosen)
-- `sendQueue: string[]` — requests waiting to be sent to Telegram
-- `activeRequestId: string | null` — the one request currently shown in Telegram
-- `processQueue()` — idempotent dispatcher: sends next from `sendQueue` if slot is free
-- Called on: new request arrives, Telegram reply received, Telegram send error
+### A: Integration tests (spawn real server) [rejected]
+Start actual HTTP server in a child process, hit it with real HTTP calls.
+Pros: tests real behaviour. Cons: requires real Telegram env vars, slow, flaky.
 
-**Pros:** minimal state, correct FIFO, no changes to HTTP surface
-**Cons:** none significant
+### B: Module-level mock injection (chosen)
+- Mock `node:http` `createServer` to capture the request-handler closure
+- Mock `fetch` globally for Telegram API calls
+- Mock `@modelcontextprotocol/sdk` to avoid stdio side-effects
+- Exercise handler directly with synthetic IncomingMessage / ServerResponse stubs
+Pros: fast, hermetic, gets real branch coverage numbers. Cons: slightly indirect.
 
-### B: Re-use pendingQueue with a "sent" flag per entry
-- Add `sent: boolean` to RequestEntry; only send when previous entry.sent becomes answered
-- Messier: requires scanning queue rather than O(1) slot check
+### C: Static analysis only (no runtime coverage)
+Enumerate uncovered paths by reading the source. Produces no numbers.
+Rejected — task asks to "run coverage analysis tools."
 
-**Chosen: A** — cleaner, minimal diff
+**Chosen: B** with ts-jest v29 + `--coverage` (V8 provider).
 
-## Files to Touch
-- `src/service.ts` — only file that changes
+## Files to touch
+- `package.json` — add jest + ts-jest dev deps, jest config, test script
+- `src/__tests__/service.test.ts` — service HTTP handler & queue unit tests
+- `src/__tests__/mcp.test.ts`    — MCP client function tests
+- `COVERAGE_REPORT.md`           — structured gap analysis output
 
-## Key Design Decisions
-- `waiters` type: `(answer: string | null) => void` — `null` signals Telegram send failure
-- `failReason?: string` on RequestEntry — so `GET /response/:id` can return a 502
-- `processQueue()` is always called with `void` (fire-and-forget); it guards re-entrancy
-  via `activeRequestId !== null` check
-- `GET /health` updated to show `{ queued, active }` instead of `{ pending }`
-- Remove old `pendingQueue` completely (replaced by `sendQueue` + `activeRequestId`)
-
-## Risks
-- `processQueue` called concurrently: safe because it returns early if `activeRequestId !== null`
-  and `sendQueue.shift()` is synchronous (no race before await)
-- Telegram send takes time: `activeRequestId` is set before the await, so concurrent
-  `processQueue` calls return early correctly
+## Risks & Unknowns
+- `pollLoop` runs an infinite `while(true)` — covered by not triggering it
+  (listen callback mock won't call the callback)
+- mcp.ts `main()` calls `server.connect()` — mocked at SDK level
+- Environment-dependent startup (`process.exit`) — env vars set before require
+- ts-jest needs tsconfig path awareness — resolved by `tsconfig` in jest config
