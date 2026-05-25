@@ -15,13 +15,12 @@
  */
 
 import { createServer } from "http";
-import { readFile } from "fs/promises";
-import { basename, extname } from "path";
+import { tgSendMessage, tgSendPhoto, tgGetUpdates, TgUpdate } from "./tg-api";
 import {
   createServiceState,
+  createProcessQueue,
   createHttpHandler,
-  processQueue,
-  TgUpdate,
+  RequestEntry,
 } from "./service-core";
 
 // ── Config ──────────────────────────────────────────────────────────────────
@@ -41,60 +40,25 @@ if (!CHAT_ID) {
 
 const TG_API = `https://api.telegram.org/bot${BOT_TOKEN}`;
 
-// ── Telegram implementations ─────────────────────────────────────────────────
+// ── Wiring ────────────────────────────────────────────────────────────────────
 
-async function tgSendMessage(text: string): Promise<void> {
-  const res = await fetch(`${TG_API}/sendMessage`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ chat_id: CHAT_ID, text }),
-  });
-  if (!res.ok) {
-    throw new Error(`sendMessage failed: ${res.status} ${await res.text()}`);
-  }
-}
-
-async function tgSendPhoto(imagePath: string, caption: string): Promise<void> {
-  const imageData = await readFile(imagePath);
-  const ext = extname(imagePath).toLowerCase();
-  const mimeMap: Record<string, string> = {
-    ".jpg": "image/jpeg",
-    ".jpeg": "image/jpeg",
-    ".png": "image/png",
-    ".gif": "image/gif",
-    ".webp": "image/webp",
-  };
-  const mimeType = mimeMap[ext] ?? "image/jpeg";
-  const blob = new Blob([imageData], { type: mimeType });
-  const form = new FormData();
-  form.append("chat_id", CHAT_ID as string);
-  form.append("caption", caption);
-  form.append("photo", blob, basename(imagePath));
-  const res = await fetch(`${TG_API}/sendPhoto`, { method: "POST", body: form });
-  if (!res.ok) {
-    throw new Error(`sendPhoto failed: ${res.status} ${await res.text()}`);
-  }
-}
-
-async function tgGetUpdates(offset: number, timeoutSecs: number): Promise<TgUpdate[]> {
-  const res = await fetch(`${TG_API}/getUpdates`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ offset, timeout: timeoutSecs, allowed_updates: ["message"] }),
-    signal: AbortSignal.timeout((timeoutSecs + 5) * 1000),
-  });
-  if (!res.ok) {
-    throw new Error(`getUpdates failed: ${res.status} ${await res.text()}`);
-  }
-  const data = (await res.json()) as { ok: boolean; result: TgUpdate[] };
-  return data.result ?? [];
-}
-
-// ── Service setup ─────────────────────────────────────────────────────────────
+const log = (msg: string): void => {
+  process.stderr.write(`[meatbag-service] ${msg}\n`);
+};
 
 const state = createServiceState();
-const tg = { sendMessage: tgSendMessage, sendPhoto: tgSendPhoto };
-const handler = createHttpHandler(state, tg);
+
+/** Sends the active entry's question to Telegram (message or photo). */
+const tgSend = async (entry: RequestEntry, tgText: string): Promise<void> => {
+  if (entry.image_path) {
+    await tgSendPhoto(TG_API, CHAT_ID as string, entry.image_path, tgText);
+  } else {
+    await tgSendMessage(TG_API, CHAT_ID as string, tgText);
+  }
+};
+
+const processQueue = createProcessQueue(state, tgSend, log);
+const httpHandler = createHttpHandler(state, processQueue, log);
 
 // ── Long-poll Telegram loop ──────────────────────────────────────────────────
 
@@ -106,10 +70,10 @@ let pollingOffset = 0;
  * in Telegram). After answering, triggers processQueue() to send the next one.
  */
 async function pollLoop(): Promise<void> {
-  process.stderr.write("[meatbag-service] Telegram polling started\n");
+  log("Telegram polling started");
   while (true) {
     try {
-      const updates = await tgGetUpdates(pollingOffset, 30);
+      const updates: TgUpdate[] = await tgGetUpdates(TG_API, pollingOffset, 30);
       for (const update of updates) {
         pollingOffset = update.update_id + 1;
 
@@ -122,7 +86,7 @@ async function pollLoop(): Promise<void> {
 
         // Match reply to the active (currently visible) request
         if (state.activeRequestId === null) {
-          process.stderr.write("[meatbag-service] Received message but no active request\n");
+          log("Received message but no active request");
           continue;
         }
 
@@ -131,44 +95,41 @@ async function pollLoop(): Promise<void> {
 
         const entry = state.requests.get(id);
         if (!entry) {
-          void processQueue(state, tg);
+          void processQueue();
           continue;
         }
 
-        process.stderr.write(`[meatbag-service] Answer received for request ${id}\n`);
+        log(`Answer received for request ${id}`);
         entry.answer = text;
         for (const waiter of entry.waiters) waiter(text);
         entry.waiters = [];
 
         // Send the next queued request now that the slot is free
-        void processQueue(state, tg);
+        void processQueue();
       }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       // AbortError / TimeoutError are expected from the long-poll timeout
       if (!msg.includes("TimeoutError") && !msg.includes("AbortError")) {
-        process.stderr.write(`[meatbag-service] Polling error: ${msg}\n`);
+        log(`Polling error: ${msg}`);
         await new Promise((r) => setTimeout(r, 1000));
       }
     }
   }
 }
 
+// ── HTTP server ───────────────────────────────────────────────────────────────
+
+const httpServer = createServer(httpHandler);
+
 // ── Start ─────────────────────────────────────────────────────────────────────
 
-const httpServer = createServer((req, res) => {
-  handler(req, res).catch((err) => {
-    const msg = err instanceof Error ? err.message : String(err);
-    process.stderr.write(`[meatbag-service] Unhandled handler error: ${msg}\n`);
-  });
-});
-
 httpServer.listen(PORT, "127.0.0.1", () => {
-  process.stderr.write(`[meatbag-service] Listening on http://127.0.0.1:${PORT}\n`);
+  log(`Listening on http://127.0.0.1:${PORT}`);
   void pollLoop();
 });
 
 httpServer.on("error", (err) => {
-  process.stderr.write(`[meatbag-service] HTTP server error: ${err.message}\n`);
+  log(`HTTP server error: ${err.message}`);
   process.exit(1);
 });

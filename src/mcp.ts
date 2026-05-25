@@ -16,7 +16,11 @@ import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
-import { SERVICE_URL, requestHumanInput } from "./mcp-client.js";
+import { requestHumanInput } from "./mcp-client";
+
+// ── Config ──────────────────────────────────────────────────────────────────
+
+const SERVICE_URL = process.env.MEATBAG_SERVICE_URL ?? "http://localhost:7702";
 
 // ── MCP Server ────────────────────────────────────────────────────────────────
 
@@ -76,7 +80,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     typeof args.image_path === "string" ? args.image_path : undefined;
 
   try {
-    const answer = await requestHumanInput(args.question, image_path);
+    const answer = await requestHumanInput(SERVICE_URL, args.question, image_path);
     return {
       content: [{ type: "text", text: answer }],
     };
