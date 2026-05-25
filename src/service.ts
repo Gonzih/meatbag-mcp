@@ -14,10 +14,15 @@
  *   GET  /health           → { status: "ok", queued, active }
  */
 
-import { createServer, IncomingMessage, ServerResponse } from "http";
+import { createServer } from "http";
 import { readFile } from "fs/promises";
-import { randomUUID } from "crypto";
 import { basename, extname } from "path";
+import {
+  createServiceState,
+  createHttpHandler,
+  processQueue,
+  TgUpdate,
+} from "./service-core";
 
 // ── Config ──────────────────────────────────────────────────────────────────
 
@@ -36,21 +41,7 @@ if (!CHAT_ID) {
 
 const TG_API = `https://api.telegram.org/bot${BOT_TOKEN}`;
 
-// ── Telegram types ───────────────────────────────────────────────────────────
-
-interface TgMessage {
-  message_id: number;
-  chat: { id: number };
-  text?: string;
-  caption?: string;
-}
-
-interface TgUpdate {
-  update_id: number;
-  message?: TgMessage;
-}
-
-// ── Telegram helpers (native fetch) ──────────────────────────────────────────
+// ── Telegram implementations ─────────────────────────────────────────────────
 
 async function tgSendMessage(text: string): Promise<void> {
   const res = await fetch(`${TG_API}/sendMessage`, {
@@ -99,79 +90,11 @@ async function tgGetUpdates(offset: number, timeoutSecs: number): Promise<TgUpda
   return data.result ?? [];
 }
 
-// ── In-memory request store ──────────────────────────────────────────────────
+// ── Service setup ─────────────────────────────────────────────────────────────
 
-interface RequestEntry {
-  id: string;
-  question: string;
-  image_path?: string;
-  context?: string;
-  answer?: string;
-  /** Set if the Telegram send failed — waiters receive null */
-  failReason?: string;
-  /** Callbacks waiting on GET /response/:id. null answer signals failure. */
-  waiters: Array<(answer: string | null) => void>;
-}
-
-/** All tracked requests */
-const requests = new Map<string, RequestEntry>();
-
-/**
- * FIFO queue of request IDs whose Telegram message has NOT been sent yet.
- * Only the active request is visible in Telegram at any time.
- */
-const sendQueue: string[] = [];
-
-/**
- * The request currently shown in Telegram (message sent, awaiting reply).
- * null when no request is active.
- */
-let activeRequestId: string | null = null;
-
-// ── Queue dispatcher ──────────────────────────────────────────────────────────
-
-/**
- * Sends the next queued request to Telegram if no request is currently active.
- * Idempotent: safe to call multiple times concurrently.
- */
-async function processQueue(): Promise<void> {
-  // Another request is already active — wait for its reply before sending next
-  if (activeRequestId !== null) return;
-  if (sendQueue.length === 0) return;
-
-  const id = sendQueue.shift()!;
-  const entry = requests.get(id);
-  if (!entry) {
-    // Entry was removed (shouldn't happen normally) — try next
-    void processQueue();
-    return;
-  }
-
-  // Claim the active slot before any await to prevent concurrent sends
-  activeRequestId = id;
-
-  let tgText = entry.question;
-  if (entry.context) tgText = `[Context: ${entry.context}]\n\n${entry.question}`;
-
-  try {
-    if (entry.image_path) {
-      await tgSendPhoto(entry.image_path, tgText);
-    } else {
-      await tgSendMessage(tgText);
-    }
-    process.stderr.write(`[meatbag-service] Sent to Telegram: ${id}\n`);
-  } catch (tgErr) {
-    // Send failed — release the active slot and notify waiters of the error
-    activeRequestId = null;
-    const msg = tgErr instanceof Error ? tgErr.message : String(tgErr);
-    process.stderr.write(`[meatbag-service] Telegram send failed for ${id}: ${msg}\n`);
-    entry.failReason = msg;
-    for (const waiter of entry.waiters) waiter(null);
-    entry.waiters = [];
-    // Try to send the next queued request
-    void processQueue();
-  }
-}
+const state = createServiceState();
+const tg = { sendMessage: tgSendMessage, sendPhoto: tgSendPhoto };
+const handler = createHttpHandler(state, tg);
 
 // ── Long-poll Telegram loop ──────────────────────────────────────────────────
 
@@ -198,17 +121,17 @@ async function pollLoop(): Promise<void> {
         if (!text) continue;
 
         // Match reply to the active (currently visible) request
-        if (activeRequestId === null) {
+        if (state.activeRequestId === null) {
           process.stderr.write("[meatbag-service] Received message but no active request\n");
           continue;
         }
 
-        const id = activeRequestId;
-        activeRequestId = null; // release slot before notifying waiters
+        const id = state.activeRequestId;
+        state.activeRequestId = null; // release slot before notifying waiters
 
-        const entry = requests.get(id);
+        const entry = state.requests.get(id);
         if (!entry) {
-          void processQueue();
+          void processQueue(state, tg);
           continue;
         }
 
@@ -218,7 +141,7 @@ async function pollLoop(): Promise<void> {
         entry.waiters = [];
 
         // Send the next queued request now that the slot is free
-        void processQueue();
+        void processQueue(state, tg);
       }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -231,131 +154,14 @@ async function pollLoop(): Promise<void> {
   }
 }
 
-// ── HTTP helpers ─────────────────────────────────────────────────────────────
-
-function readBody(req: IncomingMessage): Promise<string> {
-  return new Promise((resolve, reject) => {
-    let body = "";
-    req.on("data", (chunk) => (body += chunk));
-    req.on("end", () => resolve(body));
-    req.on("error", reject);
-  });
-}
-
-function sendJson(res: ServerResponse, status: number, data: unknown): void {
-  if (res.destroyed || res.writableEnded) return;
-  const body = JSON.stringify(data);
-  res.writeHead(status, { "Content-Type": "application/json" });
-  res.end(body);
-}
-
-// ── HTTP server ───────────────────────────────────────────────────────────────
-
-const httpServer = createServer(async (req: IncomingMessage, res: ServerResponse) => {
-  const url = req.url ?? "/";
-  const method = req.method ?? "GET";
-
-  try {
-    // GET /health
-    if (method === "GET" && url === "/health") {
-      sendJson(res, 200, {
-        status: "ok",
-        queued: sendQueue.length,
-        active: activeRequestId,
-      });
-      return;
-    }
-
-    // POST /request
-    if (method === "POST" && url === "/request") {
-      const bodyStr = await readBody(req);
-      let parsed: { question?: unknown; image_path?: unknown; context?: unknown };
-      try {
-        parsed = JSON.parse(bodyStr) as typeof parsed;
-      } catch {
-        sendJson(res, 400, { error: "invalid JSON body" });
-        return;
-      }
-
-      const { question, image_path, context } = parsed;
-      if (typeof question !== "string" || !question) {
-        sendJson(res, 400, { error: "question (string) is required" });
-        return;
-      }
-
-      const id = randomUUID();
-      const entry: RequestEntry = {
-        id,
-        question,
-        image_path: typeof image_path === "string" ? image_path : undefined,
-        context: typeof context === "string" ? context : undefined,
-        waiters: [],
-      };
-      requests.set(id, entry);
-      sendQueue.push(id);
-
-      process.stderr.write(`[meatbag-service] Request queued: ${id} (queue depth: ${sendQueue.length})\n`);
-      sendJson(res, 200, { request_id: id });
-
-      // Kick the dispatcher — will send immediately if no request is active
-      void processQueue();
-      return;
-    }
-
-    // GET /response/:id — long-poll up to 30s
-    const responseMatch = /^\/response\/([^/]+)$/.exec(url);
-    if (method === "GET" && responseMatch) {
-      const id = responseMatch[1];
-      const entry = requests.get(id);
-      if (!entry) {
-        sendJson(res, 404, { error: "request not found" });
-        return;
-      }
-
-      // Already answered — return immediately
-      if (entry.answer !== undefined) {
-        sendJson(res, 200, { answer: entry.answer });
-        return;
-      }
-
-      // Telegram send already failed — return error immediately
-      if (entry.failReason !== undefined) {
-        sendJson(res, 502, { error: `Telegram error: ${entry.failReason}` });
-        return;
-      }
-
-      // Long-poll: hold connection until answer arrives or 30s elapses
-      await new Promise<void>((resolve) => {
-        const timer = setTimeout(() => {
-          const idx = entry.waiters.indexOf(handler);
-          if (idx !== -1) entry.waiters.splice(idx, 1);
-          sendJson(res, 200, {}); // empty → client should retry
-          resolve();
-        }, 30_000);
-
-        const handler = (answer: string | null) => {
-          clearTimeout(timer);
-          if (answer === null) {
-            sendJson(res, 502, { error: `Telegram error: ${entry.failReason ?? "send failed"}` });
-          } else {
-            sendJson(res, 200, { answer });
-          }
-          resolve();
-        };
-        entry.waiters.push(handler);
-      });
-      return;
-    }
-
-    sendJson(res, 404, { error: "not found" });
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    process.stderr.write(`[meatbag-service] Request handler error: ${msg}\n`);
-    sendJson(res, 500, { error: msg });
-  }
-});
-
 // ── Start ─────────────────────────────────────────────────────────────────────
+
+const httpServer = createServer((req, res) => {
+  handler(req, res).catch((err) => {
+    const msg = err instanceof Error ? err.message : String(err);
+    process.stderr.write(`[meatbag-service] Unhandled handler error: ${msg}\n`);
+  });
+});
 
 httpServer.listen(PORT, "127.0.0.1", () => {
   process.stderr.write(`[meatbag-service] Listening on http://127.0.0.1:${PORT}\n`);

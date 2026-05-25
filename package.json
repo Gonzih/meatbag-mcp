@@ -9,6 +9,7 @@
   },
   "scripts": {
     "build": "tsc",
+    "test": "vitest run",
     "dev:mcp": "ts-node src/mcp.ts",
     "dev:service": "ts-node src/service.ts",
     "test": "jest --forceExit"
