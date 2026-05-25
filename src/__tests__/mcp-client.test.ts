@@ -71,6 +71,11 @@ describe("postRequest", () => {
       "Service returned no request_id"
     );
   });
+
+  test("includes non-Error rejection value in error message", async () => {
+    mockFetch.mockRejectedValueOnce("connection dropped");
+    await expect(postRequest(SERVICE_URL, "Q")).rejects.toThrow("connection dropped");
+  });
 });
 
 // ── pollResponse ──────────────────────────────────────────────────────────────
@@ -121,6 +126,18 @@ describe("pollResponse", () => {
     await pollResponse(SERVICE_URL, "my-request-id", 60_000, 0);
     expect(mockFetch.mock.calls[0][0]).toBe(
       `${SERVICE_URL}/response/my-request-id`
+    );
+  });
+
+  test("includes non-Error rejection value in error message", async () => {
+    mockFetch.mockRejectedValueOnce(42);
+    await expect(pollResponse(SERVICE_URL, "req-x", 60_000, 0)).rejects.toThrow("42");
+  });
+
+  test("includes error body text in rejection message on non-ok status", async () => {
+    mockFetch.mockResolvedValueOnce(mockResponse(false, "Telegram error: gateway down", 502));
+    await expect(pollResponse(SERVICE_URL, "req-6", 60_000, 0)).rejects.toThrow(
+      "Telegram error: gateway down"
     );
   });
 });
