@@ -186,6 +186,19 @@ describe("createProcessQueue", () => {
 
     expect(log).toHaveBeenCalledWith(expect.stringContaining("ok-1"));
   });
+
+  test("handles non-Error thrown value from tgSend (e.g. a plain string)", async () => {
+    const failSender = vi.fn().mockRejectedValue("plain string rejection");
+    const { state, processQueue } = setup(failSender);
+    const entry: RequestEntry = { id: "str-fail", question: "Q?", waiters: [] };
+    state.requests.set("str-fail", entry);
+    state.sendQueue.push("str-fail");
+
+    await processQueue();
+
+    expect(entry.failReason).toBe("plain string rejection");
+    expect(state.activeRequestId).toBeNull();
+  });
 });
 
 // ── createHttpHandler ─────────────────────────────────────────────────────────

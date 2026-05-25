@@ -109,6 +109,23 @@ describe("tgSendPhoto", () => {
     const blob = form.get("photo") as File;
     expect(blob.type).toBe("image/png");
   });
+
+  test("throws when readFile rejects (file not found)", async () => {
+    const { readFile } = await import("fs/promises");
+    (readFile as ReturnType<typeof vi.fn>).mockRejectedValueOnce(
+      new Error("ENOENT: no such file or directory, open '/tmp/missing.png'")
+    );
+    await expect(
+      tgSendPhoto(TG_API, CHAT_ID, "/tmp/missing.png", "caption")
+    ).rejects.toThrow("ENOENT: no such file or directory");
+  });
+
+  test("propagates fetch network error", async () => {
+    mockFetch.mockRejectedValueOnce(new Error("network reset"));
+    await expect(
+      tgSendPhoto(TG_API, CHAT_ID, "/tmp/photo.png", "caption")
+    ).rejects.toThrow("network reset");
+  });
 });
 
 // ── tgGetUpdates ──────────────────────────────────────────────────────────────
@@ -168,5 +185,10 @@ describe("tgGetUpdates", () => {
     await expect(tgGetUpdates(TG_API, 0, 10)).resolves.toEqual([]);
     const opts = mockFetch.mock.calls[0][1] as RequestInit;
     expect(opts.signal).toBeDefined();
+  });
+
+  test("throws on network error (fetch rejects)", async () => {
+    mockFetch.mockRejectedValueOnce(new Error("connection refused"));
+    await expect(tgGetUpdates(TG_API, 0, 30)).rejects.toThrow("connection refused");
   });
 });
