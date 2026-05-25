@@ -1,51 +1,50 @@
-# PLAN: sequential question queue in meatbag-service
+# PLAN: Write tests for error handling and edge cases
 
 ## Task Restatement
-Modify `service.ts` so that only one Telegram message is visible (unanswered) at a time.
-When a second `POST /request` arrives while the first is still awaiting a reply, defer
-sending the second Telegram message until the first is answered. Queue drains FIFO.
-`mcp.ts` and the HTTP API surface must not change.
+Add a test suite covering all uncovered error handling, exception paths, boundary
+conditions, and edge cases across both `service.ts` (service-core logic) and `mcp.ts`
+(client logic). Currently zero tests exist.
 
-## Current Behavior
-- `POST /request` sends Telegram message immediately and pushes to `pendingQueue`
-- Multiple requests → multiple visible Telegram questions simultaneously
-- User has no idea which question their reply addresses
+## Challenge
+Both source files have module-level side effects (env-var checks + `process.exit`,
+`httpServer.listen`, MCP server startup) making them un-importable in tests. Functions
+are also un-exported.
 
-## Required Behavior
-- Only the "active" request is visible in Telegram at any time
-- New requests enqueue in `sendQueue`; Telegram message is deferred until active slot is free
-- On Telegram reply → mark active answered, pop next from `sendQueue`, send it
+## Approaches
 
-## Approach
+### A: Integration tests only (hit real HTTP server)
+- Spin up ServiceCore's HTTP server on a random port per test
+- Pros: tests real HTTP flow
+- Cons: can't isolate individual functions; Telegram calls still need mocking; pollLoop
+  is unkillable; startup side-effects still block
 
-### A: Single active slot + send queue (chosen)
-- `sendQueue: string[]` — requests waiting to be sent to Telegram
-- `activeRequestId: string | null` — the one request currently shown in Telegram
-- `processQueue()` — idempotent dispatcher: sends next from `sendQueue` if slot is free
-- Called on: new request arrives, Telegram reply received, Telegram send error
+### B: vi.mock the `http` module + set env vars before import (chosen not)
+- Pros: no file changes
+- Cons: extremely fragile, order-sensitive; doesn't test function internals cleanly
 
-**Pros:** minimal state, correct FIFO, no changes to HTTP surface
-**Cons:** none significant
+### C: Extract testable logic into separate core modules (CHOSEN)
+- Create `src/service-core.ts` — a `ServiceCore` class with all logic, no side effects,
+  fully exported
+- Create `src/mcp-core.ts` — `postRequest` + `pollResponse` as exported functions
+- Slim down `service.ts` / `mcp.ts` to thin entry-point wrappers
+- Write tests against the core modules with vitest + vi.mock
 
-### B: Re-use pendingQueue with a "sent" flag per entry
-- Add `sent: boolean` to RequestEntry; only send when previous entry.sent becomes answered
-- Messier: requires scanning queue rather than O(1) slot check
-
-**Chosen: A** — cleaner, minimal diff
+**Why C:** Clean isolation, no import-time side effects in core modules, full control of
+state per test, easy fetch mocking with `vi.stubGlobal`.
 
 ## Files to Touch
-- `src/service.ts` — only file that changes
-
-## Key Design Decisions
-- `waiters` type: `(answer: string | null) => void` — `null` signals Telegram send failure
-- `failReason?: string` on RequestEntry — so `GET /response/:id` can return a 502
-- `processQueue()` is always called with `void` (fire-and-forget); it guards re-entrancy
-  via `activeRequestId !== null` check
-- `GET /health` updated to show `{ queued, active }` instead of `{ pending }`
-- Remove old `pendingQueue` completely (replaced by `sendQueue` + `activeRequestId`)
+- `src/service-core.ts` — NEW: ServiceCore class + readBody/sendJson utilities
+- `src/mcp-core.ts` — NEW: postRequest, pollResponse
+- `src/service.ts` — thin wrapper, delegates to ServiceCore
+- `src/mcp.ts` — thin wrapper, imports from mcp-core
+- `src/__tests__/service-core.test.ts` — NEW: ~40 tests
+- `src/__tests__/mcp-core.test.ts` — NEW: ~10 tests
+- `vitest.config.ts` — NEW: vitest config
+- `package.json` — add test script + vitest devDependency
+- `tsconfig.json` — exclude test files from production build
 
 ## Risks
-- `processQueue` called concurrently: safe because it returns early if `activeRequestId !== null`
-  and `sendQueue.shift()` is synchronous (no race before await)
-- Telegram send takes time: `activeRequestId` is set before the await, so concurrent
-  `processQueue` calls return early correctly
+- `processQueue` is re-entrant (calls `void processQueue()` recursively): tests must
+  await full microtask queue with `await Promise.resolve()` to observe side effects
+- Long-poll setTimeout (30s): use `vi.useFakeTimers()` in those tests
+- `fs/promises` readFile mock must match module name exactly (`"fs/promises"`)

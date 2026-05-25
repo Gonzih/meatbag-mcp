@@ -1,17 +1,21 @@
-# TODO: sequential question queue
+# TODO: tests for error handling and edge cases
 
-- [ ] Create branch feat/sequential-queue
-- [ ] Update service.ts: replace pendingQueue with sendQueue + activeRequestId
-- [ ] Update service.ts: add processQueue() dispatcher
-- [ ] Update service.ts: POST /request defers Telegram send, calls processQueue()
-- [ ] Update service.ts: pollLoop resolves activeRequestId, calls processQueue()
-- [ ] Update service.ts: GET /response/:id handles failReason (502)
-- [ ] Update service.ts: GET /health shows queued/active
-- [ ] npm run build — verify passes
+- [ ] Create branch feat/error-handling-tests
+- [ ] Create src/service-core.ts (ServiceCore class + readBody/sendJson)
+- [ ] Create src/mcp-core.ts (postRequest, pollResponse)
+- [ ] Update src/service.ts — thin wrapper using ServiceCore
+- [ ] Update src/mcp.ts — import from mcp-core
+- [ ] Add vitest to package.json + test script
+- [ ] Update tsconfig.json to exclude test files from build
+- [ ] Create vitest.config.ts
+- [ ] npm install
+- [ ] Write src/__tests__/service-core.test.ts
+- [ ] Write src/__tests__/mcp-core.test.ts
+- [ ] npm test — verify all pass
+- [ ] npm run build — verify still compiles
 - [ ] git diff --staged review
 - [ ] git commit
-- [ ] git push -u origin feat/sequential-queue
-- [ ] npm version patch
-- [ ] npm publish --access public
+- [ ] git push
 - [ ] gh pr create
 - [ ] gh pr merge --squash --auto
+- [ ] npm version patch && npm publish
