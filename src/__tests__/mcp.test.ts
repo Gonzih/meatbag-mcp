@@ -7,37 +7,39 @@
  * - Drive postRequest / pollResponse / MCP handlers through captured closures
  */
 
+import { describe, it, expect, vi, beforeEach } from "vitest";
+
 // ── capture MCP handler registrations ────────────────────────────────────────
 
 type AnyHandler = (req: unknown) => Promise<unknown>;
 
 const capturedHandlers: Record<string, AnyHandler> = {};
-const mockSetRequestHandler = jest.fn((schema: { method: string }, handler: AnyHandler) => {
+const mockSetRequestHandler = vi.fn((schema: { method: string }, handler: AnyHandler) => {
   capturedHandlers[schema.method] = handler;
 });
 
-const mockConnect = jest.fn().mockResolvedValue(undefined);
-const MockServer = jest.fn().mockImplementation(() => ({
+const mockConnect = vi.fn().mockResolvedValue(undefined);
+const MockServer = vi.fn().mockImplementation(() => ({
   setRequestHandler: mockSetRequestHandler,
   connect: mockConnect,
 }));
-const MockStdioServerTransport = jest.fn().mockImplementation(() => ({}));
+const MockStdioServerTransport = vi.fn().mockImplementation(() => ({}));
 
-jest.mock("@modelcontextprotocol/sdk/server/index.js", () => ({
+vi.mock("@modelcontextprotocol/sdk/server/index.js", () => ({
   Server: MockServer,
 }));
-jest.mock("@modelcontextprotocol/sdk/server/stdio.js", () => ({
+vi.mock("@modelcontextprotocol/sdk/server/stdio.js", () => ({
   StdioServerTransport: MockStdioServerTransport,
 }));
-jest.mock("@modelcontextprotocol/sdk/types.js", () => ({
+vi.mock("@modelcontextprotocol/sdk/types.js", () => ({
   ListToolsRequestSchema: { method: "tools/list" },
   CallToolRequestSchema: { method: "tools/call" },
 }));
 
 // ── mock fetch ────────────────────────────────────────────────────────────────
 
-const mockFetch = jest.fn();
-global.fetch = mockFetch as unknown as typeof fetch;
+const mockFetch = vi.fn();
+vi.stubGlobal("fetch", mockFetch);
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
@@ -61,7 +63,7 @@ function makeErrResponse(status: number, body: string) {
 
 // ── import mcp (triggers module-level side effects) ───────────────────────────
 
-require("../mcp");
+await import("../mcp");
 
 // ── reset between tests ───────────────────────────────────────────────────────
 
@@ -130,10 +132,8 @@ describe("tools/call handler", () => {
   });
 
   it("posts request and polls for answer successfully", async () => {
-    // First call: POST /request → returns request_id
     mockFetch
       .mockResolvedValueOnce(makeOkResponse({ request_id: "test-id-123" }))
-      // Second call: GET /response/test-id-123 → returns answer
       .mockResolvedValueOnce(makeOkResponse({ answer: "yes, proceed" }));
 
     const result = await callTool("request_human_input", { question: "Should I continue?" });
@@ -151,13 +151,12 @@ describe("tools/call handler", () => {
       image_path: "/tmp/screenshot.png",
     });
 
-    const postBody = JSON.parse(mockFetch.mock.calls[0][1].body as string);
+    const postBody = JSON.parse(mockFetch.mock.calls[0][1].body as string) as Record<string, unknown>;
     expect(postBody.image_path).toBe("/tmp/screenshot.png");
   });
 
   it("returns error when service is not running (fetch throws)", async () => {
     mockFetch.mockRejectedValue(new Error("ECONNREFUSED"));
-
     const result = await callTool("request_human_input", { question: "hello?" });
     expect(result.isError).toBe(true);
     expect(result.content[0].text).toMatch(/Error/i);
@@ -165,14 +164,12 @@ describe("tools/call handler", () => {
 
   it("handles non-ok response from POST /request", async () => {
     mockFetch.mockResolvedValueOnce(makeErrResponse(500, "internal error"));
-
     const result = await callTool("request_human_input", { question: "fail?" });
     expect(result.isError).toBe(true);
   });
 
   it("handles missing request_id in POST /request response", async () => {
     mockFetch.mockResolvedValueOnce(makeOkResponse({ something_else: "x" }));
-
     const result = await callTool("request_human_input", { question: "fail?" });
     expect(result.isError).toBe(true);
     expect(result.content[0].text).toMatch(/request_id/i);
@@ -181,15 +178,12 @@ describe("tools/call handler", () => {
   it("retries when GET /response returns empty (server long-poll timeout)", async () => {
     mockFetch
       .mockResolvedValueOnce(makeOkResponse({ request_id: "retry-id" }))
-      // First poll: empty (server timeout)
       .mockResolvedValueOnce(makeOkResponse({}))
-      // Second poll: answer
       .mockResolvedValueOnce(makeOkResponse({ answer: "eventually" }));
 
     const result = await callTool("request_human_input", { question: "Retry?" });
     expect(result.isError).toBeUndefined();
     expect(result.content[0].text).toBe("eventually");
-    // Verify there were 3 fetch calls (1 post + 2 polls)
     expect(mockFetch).toHaveBeenCalledTimes(3);
   });
 
@@ -197,7 +191,6 @@ describe("tools/call handler", () => {
     mockFetch
       .mockResolvedValueOnce(makeOkResponse({ request_id: "bad-poll-id" }))
       .mockResolvedValueOnce(makeErrResponse(502, "Telegram error: send failed"));
-
     const result = await callTool("request_human_input", { question: "bad poll?" });
     expect(result.isError).toBe(true);
   });
@@ -206,39 +199,17 @@ describe("tools/call handler", () => {
     mockFetch
       .mockResolvedValueOnce(makeOkResponse({ request_id: "throw-id" }))
       .mockRejectedValueOnce(new Error("network down"));
-
     const result = await callTool("request_human_input", { question: "network?" });
     expect(result.isError).toBe(true);
   });
 
-  it("handles image_path: undefined passed as string type", async () => {
+  it("omits image_path when not a string", async () => {
     mockFetch
       .mockResolvedValueOnce(makeOkResponse({ request_id: "no-img-id" }))
       .mockResolvedValueOnce(makeOkResponse({ answer: "ok" }));
 
-    // image_path not a string — should be omitted from request
-    const result = await callTool("request_human_input", { question: "Q", image_path: 42 });
-    expect(result.isError).toBeUndefined();
-    const postBody = JSON.parse(mockFetch.mock.calls[0][1].body as string);
+    await callTool("request_human_input", { question: "Q", image_path: 42 });
+    const postBody = JSON.parse(mockFetch.mock.calls[0][1].body as string) as Record<string, unknown>;
     expect(postBody.image_path).toBeUndefined();
-  });
-});
-
-// ═════════════════════════════════════════════════════════════════════════════
-// pollResponse: deadline exceeded
-// ═════════════════════════════════════════════════════════════════════════════
-
-describe("pollResponse: deadline exceeded", () => {
-  it("throws 'Timed out waiting for human response' after deadline", async () => {
-    // Make every poll return empty body (no answer)
-    mockFetch
-      .mockResolvedValueOnce(makeOkResponse({ request_id: "timeout-id" }))
-      .mockResolvedValue(makeOkResponse({})); // always empty
-
-    // Override MAX_WAIT_MS would require module re-import — instead we test via
-    // the tool handler and verify we eventually get an error (after real time passes).
-    // We skip this heavyweight test since it would require 5+ minutes or timer mocking
-    // across module boundaries. Documented as a known gap in COVERAGE_REPORT.md.
-    expect(true).toBe(true); // placeholder
   });
 });

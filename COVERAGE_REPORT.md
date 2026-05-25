@@ -1,8 +1,8 @@
 # Coverage Gap Analysis — meatbag-mcp
 
 Generated: 2026-05-25  
-Test runner: Jest 29 + ts-jest (V8 coverage provider)  
-Command: `npm test` (30 tests, 2 suites, all pass)
+Test runner: Vitest 3.2.2 + @vitest/coverage-v8  
+Command: `npm run coverage` (105 tests, 5 suites, all pass)
 
 ---
 
@@ -10,34 +10,74 @@ Command: `npm test` (30 tests, 2 suites, all pass)
 
 | File | Statements | Branches | Functions | Lines |
 |------|-----------|----------|-----------|-------|
-| `src/mcp.ts` | **96.23%** (154/160) | **88.89%** (32/36) | **100%** (5/5) | **96.23%** |
-| `src/service.ts` | **76.08%** (305/401) | **75.86%** (44/58) | **66.67%** (8/12) | **76.08%** |
-| **Overall** | **82.85%** (459/554) | **80.85%** (76/94) | **76.92%** (10/13) | **82.85%** |
+| `src/mcp.ts` | **94.81%** | **88.89%** | **100%** | **94.81%** |
+| `src/service-core.ts` | **100%** | **92.30%** | **100%** | **100%** |
+| `src/service.ts` | **42.24%** | **37.50%** | **50%** | **42.24%** |
+| **Overall** | **81.36%** | **87.15%** | **86.67%** | **81.36%** |
+
+### Test suites
+| File | Tests | Purpose |
+|---|---|---|
+| `src/__tests__/http-utils.test.ts` | 13 | `readBody`, `sendJson` from service-core |
+| `src/__tests__/queue.test.ts` | 11 | Request store + queue state machine |
+| `src/__tests__/service-core.test.ts` | 52 | Full HTTP endpoints via real test server |
+| `src/__tests__/service.test.ts` | 14 | service.ts module: startup, tgSend*, pollLoop wrapper |
+| `src/__tests__/mcp.test.ts` | 15 | MCP client (postRequest, pollResponse, tool handlers) |
 
 ---
 
-## `src/mcp.ts` — Gap Details
+## `src/service-core.ts` — Gap Details (100% statements, 92.3% branches)
 
-### Uncovered lines: 88–90, 182–185
+`service-core.ts` achieves full statement coverage thanks to the comprehensive
+`service-core.test.ts` suite. The remaining branch gaps are:
 
-#### Lines 88–90 — `pollResponse` deadline exceeded
+### Uncovered branches: lines 118, 148–149, 234, 248
+
+**Line 118** — `processQueue`: `if (!entry)` guard (entry removed from Map after
+enqueue — impossible under normal operation; defensive guard).
+
+**Lines 148–149** — `processQueue` catch block: the `void processQueue(state, tg)`
+recursive call after failure. This line executes but the branch where `sendQueue`
+is non-empty at that point is not exercised (the error tests drain the queue).
+
+**Line 234** — `GET /response/:id`: `if (answer === null)` inside the long-poll
+waiter callback. This requires a Telegram failure *while* a waiter is actively
+long-polling. The test suite covers the failure path via `failReason` (fast-return
+before a waiter is registered) but not the concurrent-failure scenario.
+
+**Line 248** — `GET /response/:id`: `sendJson(res, 404, ...)` for `!entry` path
+inside the long-poll continuation. Requires an entry to be garbage-collected while
+a GET /response/:id is long-polling.
+
+**Risk:** Low for all four — these are edge-case guards for race conditions or corrupt
+state that don't arise in production without bugs elsewhere.
+
+**Suggested fix for 234:** Register a waiter via GET /response/:id long-poll, then
+call processQueue directly with a failing sender, verify the null branch fires.
+
+---
+
+## `src/mcp.ts` — Gap Details (94.81% statements)
+
+### Uncovered lines: 89–90, 182–186
+
+**Lines 89–90** — `pollResponse` deadline exceeded
 ```typescript
-// line 89
 throw new Error("Timed out waiting for human response (5 minutes)");
 ```
 **Why uncovered:** Requires the 5-minute `MAX_WAIT_MS` deadline to elapse while every
-poll returns an empty response. Without mocking `Date.now()` at the module level this
-path cannot be reached in a short-lived test.
+poll returns an empty body. Without mocking `Date.now()` across a module boundary
+this path cannot be reached in a short-lived test.
 
-**Risk:** Medium. If the service becomes permanently unresponsive, MCP clients would
-hang forever rather than surfacing a clean error.
+**Risk:** Medium. If the service becomes permanently unresponsive, MCP clients hang
+forever rather than surfacing a clean error to the LLM agent.
 
-**Suggested fix:** Extract `MAX_WAIT_MS` to an injectable config, or spy on `Date.now`
-and `setTimeout` to fast-forward time in an isolated module test.
+**Suggested fix:** Spy on `Date.now` to return a value beyond the deadline after the
+first call, then verify the next `while` iteration exits and throws.
 
 ---
 
-#### Lines 182–185 — `main()` fatal error handler
+**Lines 182–186** — `main()` fatal error catch handler
 ```typescript
 main().catch((err) => {
   process.stderr.write(`[meatbag-mcp] Fatal: ...`);
@@ -46,228 +86,147 @@ main().catch((err) => {
 ```
 **Why uncovered:** `server.connect()` is mocked to succeed; the catch branch never fires.
 
-**Risk:** Low. Any unhandled error in main() silently swallows the stack trace without
-this path being tested.
+**Risk:** Low. Any unhandled startup error silently swallows the stack trace.
 
-**Suggested fix:** In an isolated module test, mock `StdioServerTransport` to throw and
-spy on `process.exit`.
+**Suggested fix:** Mock `StdioServerTransport` to throw, spy on `process.exit`.
 
 ---
 
-## `src/service.ts` — Gap Details
+## `src/service.ts` — Gap Details (42.24% statements)
 
-### Uncovered lines: 29–31, 33–35 — Missing env-var exit paths
+`service.ts` is a thin shell: env-var checks, concrete Telegram implementations,
+server startup, and the `pollLoop`. Most business logic lives in `service-core.ts`
+(100% covered). The low statement coverage of `service.ts` reflects functions that
+cannot safely run in tests (infinite polling loop, Telegram API helpers, server startup).
 
+### What IS covered in service.ts (tests in service.test.ts)
+- Env-var validation path (BOT_TOKEN, CHAT_ID present → no exit)
+- `createServer` call — wrapper captured
+- GET /health, POST /request (validation + success), GET /response/:id (404, 502, long-poll timeout)
+- `tgSendMessage` happy path (via processQueue, covered by sendMessage failure test)
+- `tgSendPhoto` happy path (via processQueue photo test)
+- `tgSendMessage` error path → catch → `failReason` set
+- Unknown routes → 404
+- Body stream error → 500
+
+### Uncovered lines in service.ts
+
+**Lines 33–40** — Startup exit for missing env vars
 ```typescript
-if (!BOT_TOKEN) {
-  process.stderr.write("[meatbag-service] MEATBAG_BOT_TOKEN env var is required\n");
-  process.exit(1);
-}
+if (!BOT_TOKEN) { process.exit(1); }
+if (!CHAT_ID)   { process.exit(1); }
 ```
-**Why uncovered:** Env vars are set before the module is required; these guards never
-fire during the test run.
-
-**Risk:** Low — the guard is a one-liner exit. Real-world failure is easy to observe.
-
-**Suggested fix:** Use `jest.isolateModules()` with `process.exit` spied-on and env vars
-temporarily deleted, then re-set after the isolated require.
+**Why:** Env vars set before module import; guards never fire.
+**Risk:** Low (observable at startup; one-line guards).
+**Fix:** `vi.isolateModules()` + delete env var + spy on `process.exit`.
 
 ---
 
-### Uncovered lines: 84–85 — `tgSendMessage` happy-path `!res.ok` guard
-
+**Lines 79–91** — `tgGetUpdates` function (entire function)
 ```typescript
-if (!res.ok) {
-  throw new Error(`sendMessage failed: ${res.status} ${await res.text()}`);
-}
+async function tgGetUpdates(offset, timeoutSecs): Promise<TgUpdate[]> { ... }
 ```
-**Note:** The *throw path* (lines 62–63 / same guard in tgSendMessage) **is** covered
-by the processQueue failure test. The uncovered lines 84–85 refer to the analogous
-guard inside **`tgGetUpdates`** (lines 88–100), which is part of the polling loop.
+**Why:** Only called from `pollLoop`. The `listen` callback mock does not invoke the
+callback, so `pollLoop` is never started.
+**Risk:** High. Bugs in offset management, JSON parsing, or error handling in
+`getUpdates` are completely invisible to the test suite.
+**Fix:** Extract `tgGetUpdates` to `service-core.ts` (or a shared module) and add
+direct unit tests for it — success path, `!res.ok` path, and the `.result ?? []`
+fallback.
 
 ---
 
-### Uncovered lines: 88–100 — `tgGetUpdates` function (entire function)
-
+**Lines 108–155** — `pollLoop` function (entire function)
 ```typescript
-async function tgGetUpdates(offset: number, timeoutSecs: number): Promise<TgUpdate[]> {
-  const res = await fetch(`${TG_API}/getUpdates`, { ... });
-  if (!res.ok) { throw new Error(...); }
-  const data = ... as { ok: boolean; result: TgUpdate[] };
-  return data.result ?? [];
-}
+async function pollLoop(): Promise<void> { while (true) { ... } }
 ```
-**Why uncovered:** `tgGetUpdates` is only called from `pollLoop`. The HTTP server's
-`listen` callback (which starts `pollLoop`) is mocked to not invoke its callback, so
-the polling loop never runs.
+**Why:** `pollLoop()` is called inside the `listen` callback which is mocked to not
+fire.
 
-**Risk:** High. This is the only path through which Telegram replies are received.
-Any bug in offset management, JSON parsing, or error recovery goes completely untested.
-
-**Suggested fix:** Export `tgGetUpdates` (or a thin wrapper) and test it directly
-with mocked `fetch`, or start `pollLoop` in a controlled test with fake timers and
-a mock that immediately returns updates.
-
----
-
-### Uncovered lines: 145–148 — `processQueue`: entry-not-found edge case
-
-```typescript
-if (!entry) {
-  void processQueue(); // try next
-  return;
-}
-```
-**Why uncovered:** Requires a request ID to be in `sendQueue` with no corresponding
-entry in the `requests` Map — an impossible state under normal operation.
-
-**Risk:** Negligible (defensive guard for corrupt state).
-
----
-
-### Uncovered lines: 161, 185–232 — `pollLoop` (entire function)
-
-```typescript
-async function pollLoop(): Promise<void> {
-  process.stderr.write("[meatbag-service] Telegram polling started\n");
-  while (true) { ... }
-}
-```
-Line 161 is the `image_path` branch inside `processQueue` (partially covered — the
-`tgSendPhoto` call is reached but the surrounding branch condition varies).
-
-Lines 185–232 cover the entire `pollLoop` body including:
-- Normal Telegram reply routing → `activeRequestId` cleared, waiters notified
+Key untested branches inside pollLoop:
+- Normal Telegram reply routing → `state.activeRequestId` cleared, waiters notified
 - Chat ID mismatch guard
-- Empty message guard  
-- `activeRequestId === null` guard (no active request)
-- Entry-not-found guard after clearing activeRequestId
-- Error handling with retry delay
-- AbortError / TimeoutError suppression
+- Empty text guard
+- No active request guard
+- Entry-not-found guard after clearing `activeRequestId`
+- Non-abort polling error → 1-second retry delay
+- AbortError/TimeoutError suppression
 
 **Risk:** Very high. This is the core business logic: routing Telegram replies to
-waiting HTTP clients. None of these paths are exercised by unit tests.
+waiting HTTP clients. Every failure mode here is completely untested at the
+integration level.
 
-**Suggested fix:**
-1. Extract `pollLoop` body into a `handleUpdate(update: TgUpdate)` function
-2. Unit-test `handleUpdate` with synthetic update objects
-3. Test the error-recovery path (non-abort errors, abort errors, empty update list)
-
----
-
-### Uncovered lines: 317–319, 337–343 — `GET /response/:id` long-poll success paths
-
-```typescript
-// line 317-319: already-answered fast path
-if (entry.answer !== undefined) {
-  sendJson(res, 200, { answer: entry.answer });
-  return;
-}
-
-// lines 337-343: waiter callback (answer arrives while polling)
-const handler = (answer: string | null) => {
-  clearTimeout(timer);
-  if (answer === null) {
-    sendJson(res, 502, { error: `Telegram error: ...` });
-  } else {
-    sendJson(res, 200, { answer });
-  }
-  resolve();
-};
-```
-**Why uncovered:** Both paths require `entry.answer` to be set, which only happens
-inside `pollLoop` when a Telegram reply is received. Since `pollLoop` is never started
-in tests, `answer` is never populated.
-
-The `answer === null` branch of the waiter callback (502 when Telegram fails *while*
-a GET /response is long-polling) is similarly unreachable.
-
-**Risk:** High. The primary success path — human answers → client gets the answer —
-is completely untested.
-
-**Suggested fix:** After extracting `handleUpdate`, call it in tests to simulate a
-Telegram reply arriving while a waiter is registered. Test both the happy path
-(string answer) and the failure path (null → 502).
+**Fix (priority):**
+1. Extract a `handleUpdate(state, tg, update)` function from `pollLoop` body
+2. Unit-test `handleUpdate` with synthetic `TgUpdate` objects
+3. Test: normal reply, chat ID mismatch, empty text, no active request, entry gone,
+   multiple queued requests drain correctly after each reply
 
 ---
 
-### Uncovered lines: 361–362 — `httpServer.listen` callback and `pollLoop` start
-
+**Lines 167–174** — Server startup callback and error handler
 ```typescript
 httpServer.listen(PORT, "127.0.0.1", () => {
-  process.stderr.write(`[meatbag-service] Listening on http://127.0.0.1:${PORT}\n`);
-  void pollLoop(); // ← line 362
+  process.stderr.write(...);
+  void pollLoop();           // line 168
 });
-```
-**Why uncovered:** `listen` is mocked to not invoke its callback.
-
-**Risk:** Low for the callback itself; high coverage impact is already captured under
-the `pollLoop` gap above.
-
----
-
-### Uncovered lines: 366–367 — HTTP server error handler
-
-```typescript
 httpServer.on("error", (err) => {
-  process.stderr.write(`[meatbag-service] HTTP server error: ${err.message}\n`);
-  process.exit(1);
+  process.stderr.write(...);
+  process.exit(1);           // line 173
 });
 ```
-**Why uncovered:** Requires `httpServer` to emit an `"error"` event; the mock server
-object's `on` is a jest stub that doesn't emit.
-
-**Risk:** Low (error handler is boilerplate; process.exit is hard to test anyway).
-
----
-
-## Branch-Level Gaps
-
-| Location | Condition | Missing branch |
-|---|---|---|
-| `service.ts:155` | `if (entry.context)` in processQueue | context present (tested via POST with context field) |
-| `service.ts:157` | `if (entry.image_path)` | both branches covered |
-| `service.ts:195–196` | `if (!msg)` / chat ID check | both guards — inside pollLoop (not started) |
-| `service.ts:200` | `if (activeRequestId === null)` | both — inside pollLoop |
-| `service.ts:226` | AbortError/TimeoutError filter | both — inside pollLoop error handler |
-| `mcp.ts:88` | `while (Date.now() < deadline)` | exit when deadline exceeded |
-| `mcp.ts:135` | `request.params.name !== "request_human_input"` | covered (unknown tool test) |
+**Why:** `listen` mock does not invoke callback; `on("error")` is a no-op stub.
+**Risk:** Low (boilerplate; `process.exit` is hard to test cleanly).
 
 ---
 
 ## Prioritised Remediation Roadmap
 
-### Priority 1 — Core business logic (high risk)
-1. Extract `handleUpdate(update: TgUpdate)` from `pollLoop` and add unit tests  
-   covering: normal reply, chat ID mismatch, empty text, no active request, entry gone.
-2. Add a `GET /response/:id` test that populates `entry.answer` via `handleUpdate`
-   and verifies the fast-path 200 response.
-3. Test the long-poll waiter callback: register a waiter, then call `handleUpdate` to
-   trigger it — verify both the success (200) and failure (502) branches.
+### Priority 1 — Core business logic (very high risk, quick wins)
 
-### Priority 2 — Error recovery (medium risk)
-4. Test `tgGetUpdates` in isolation with mocked fetch (ok path + !ok path).
-5. Test `pollLoop` error recovery: non-abort error → 1s delay → continues.
-6. Test `pollResponse` deadline exceeded in mcp.ts via `Date.now` mock.
+1. **Extract `handleUpdate(state, tg, update: TgUpdate)` from `pollLoop`** and add to
+   `service-core.ts`. Unit-test all branches:
+   - Normal reply → answer stored, waiters fired, next queue item sent
+   - Chat ID mismatch → ignored
+   - Empty text → ignored
+   - No active request → logged and skipped
+   - Entry disappeared after clearing activeRequestId → processQueue called anyway
 
-### Priority 3 — Startup validation (low risk)
-7. Add isolated-module tests for missing `MEATBAG_BOT_TOKEN` / `MEATBAG_CHAT_ID`
-   with `process.exit` spied on.
-8. Add `main().catch` test in mcp.ts by mocking `server.connect` to reject.
+2. **Test concurrent Telegram failure** (service-core.ts line 234): start a
+   GET /response/:id long-poll, then trigger processQueue failure, verify the
+   `null` waiter branch fires and the client gets a 502.
+
+3. **Test `tgGetUpdates`** (service.ts lines 79–91): extract to service-core or
+   mock at the fetch level and add success + error unit tests.
+
+### Priority 2 — Timeout and startup (medium risk)
+
+4. **Test `pollResponse` deadline exceeded** (mcp.ts:89–90): spy on `Date.now` to
+   return a value beyond `MAX_WAIT_MS`, verify `Timed out` error is thrown.
+
+5. **Test missing env vars** (service.ts:33–40): `vi.isolateModules()` + `process.exit`
+   spy to verify correct error messages.
+
+### Priority 3 — Low-risk boilerplate (low risk)
+
+6. Server error handler (`process.exit` on server `"error"` event)
+7. `main().catch` handler in mcp.ts
 
 ---
 
-## What Current Tests Do Cover
+## Coverage Status: What the test suite verifies end-to-end
 
 - All HTTP input validation (400s for bad JSON, missing/empty question)
-- Request body stream error → 500 handler
-- `processQueue` normal dispatch: sends to Telegram via `tgSendMessage`
-- `processQueue` error path: Telegram failure → `failReason` set → 502 on next GET
-- `processQueue` image path: `tgSendPhoto` called when `image_path` is present
+- Request body stream error → 500 handler  
+- `processQueue` text-message dispatch path (sends to Telegram, sets activeRequestId)
+- `processQueue` failure path (Telegram error → failReason → 502 on next GET)
+- `processQueue` photo path (image_path → sendPhoto endpoint called)
 - `GET /response/:id` — 404 for unknown ID
-- `GET /response/:id` — 502 fast-path when `failReason` is already set
-- `GET /response/:id` — long-poll timeout (30s timer fires → empty `{}` body)
+- `GET /response/:id` — 502 fast-path when failReason already set
+- `GET /response/:id` — long-poll 30s timeout → empty `{}` body
 - `sendJson` guard for `res.destroyed`
-- All MCP tool-list and tool-call handler branches except the deadline-exceeded path
+- All MCP tool-list and tool-call handler branches (except deadline exceeded)
 - `postRequest`: success, service-down, non-ok response, missing request_id
 - `pollResponse`: success, retry on empty, non-ok response, fetch throw
+- Sequential queue behavior end-to-end (service-core.test.ts)
+- Multiple concurrent long-pollers all receive the same answer (service-core.test.ts)
