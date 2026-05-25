@@ -25,13 +25,14 @@ const MAX_WAIT_MS = 5 * 60 * 1_000; // 5 minutes total
 
 // ── Service client ───────────────────────────────────────────────────────────
 
-async function postRequest(
+export async function postRequest(
   question: string,
-  image_path?: string
+  image_path?: string,
+  serviceUrl: string = SERVICE_URL
 ): Promise<string> {
   let res: Response;
   try {
-    res = await fetch(`${SERVICE_URL}/request`, {
+    res = await fetch(`${serviceUrl}/request`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ question, image_path }),
@@ -40,14 +41,14 @@ async function postRequest(
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     throw new Error(
-      `meatbag-service is not running on ${SERVICE_URL}: ${msg}\n` +
+      `meatbag-service is not running on ${serviceUrl}: ${msg}\n` +
         `Start it with: MEATBAG_BOT_TOKEN=<token> MEATBAG_CHAT_ID=<id> meatbag-service`
     );
   }
 
   if (!res.ok) {
     const body = await res.text();
-    throw new Error(`POST ${SERVICE_URL}/request failed (${res.status}): ${body}`);
+    throw new Error(`POST ${serviceUrl}/request failed (${res.status}): ${body}`);
   }
 
   const data = (await res.json()) as { request_id?: string; error?: string };
@@ -57,19 +58,23 @@ async function postRequest(
   return data.request_id;
 }
 
-async function pollResponse(requestId: string): Promise<string> {
-  const deadline = Date.now() + MAX_WAIT_MS;
+export async function pollResponse(
+  requestId: string,
+  serviceUrl: string = SERVICE_URL,
+  maxWaitMs: number = MAX_WAIT_MS,
+  pollIntervalMs: number = POLL_INTERVAL_MS
+): Promise<string> {
+  const deadline = Date.now() + maxWaitMs;
 
   while (Date.now() < deadline) {
     let res: Response;
     try {
-      // GET /response/:id long-polls for up to 30s on the server side
-      res = await fetch(`${SERVICE_URL}/response/${requestId}`, {
-        signal: AbortSignal.timeout(35_000), // 30s server long-poll + 5s buffer
+      res = await fetch(`${serviceUrl}/response/${requestId}`, {
+        signal: AbortSignal.timeout(35_000),
       });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      throw new Error(`GET ${SERVICE_URL}/response/${requestId} failed: ${msg}`);
+      throw new Error(`GET ${serviceUrl}/response/${requestId} failed: ${msg}`);
     }
 
     if (!res.ok) {
@@ -82,105 +87,106 @@ async function pollResponse(requestId: string): Promise<string> {
       return data.answer;
     }
 
-    // Server timed out with no answer — wait briefly and retry
-    await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
+    await new Promise((r) => setTimeout(r, pollIntervalMs));
   }
 
   throw new Error("Timed out waiting for human response (5 minutes)");
 }
 
-async function requestHumanInput(
+export async function requestHumanInput(
   question: string,
-  image_path?: string
+  image_path?: string,
+  serviceUrl: string = SERVICE_URL
 ): Promise<string> {
-  const requestId = await postRequest(question, image_path);
-  return pollResponse(requestId);
+  const requestId = await postRequest(question, image_path, serviceUrl);
+  return pollResponse(requestId, serviceUrl);
 }
 
 // ── MCP Server ────────────────────────────────────────────────────────────────
 
-const server = new Server(
-  { name: "meatbag-mcp", version: "1.1.0" },
-  { capabilities: { tools: {} } }
-);
+/* istanbul ignore next */
+if (require.main === module) {
+  const server = new Server(
+    { name: "meatbag-mcp", version: "1.1.0" },
+    { capabilities: { tools: {} } }
+  );
 
-server.setRequestHandler(ListToolsRequestSchema, async () => ({
-  tools: [
-    {
-      name: "request_human_input",
-      description:
-        "Send a message to the human operator via Telegram and wait for their reply. " +
-        "Use this when you need a human decision, approval, captcha solution, or free-text input. " +
-        "Requires meatbag-service to be running on localhost:7702.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          question: {
-            type: "string",
-            description: "The question or prompt to send to the human operator.",
+  server.setRequestHandler(ListToolsRequestSchema, async () => ({
+    tools: [
+      {
+        name: "request_human_input",
+        description:
+          "Send a message to the human operator via Telegram and wait for their reply. " +
+          "Use this when you need a human decision, approval, captcha solution, or free-text input. " +
+          "Requires meatbag-service to be running on localhost:7702.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            question: {
+              type: "string",
+              description: "The question or prompt to send to the human operator.",
+            },
+            image_path: {
+              type: "string",
+              description:
+                "Optional absolute path to an image file to send along with the question.",
+            },
           },
-          image_path: {
-            type: "string",
-            description:
-              "Optional absolute path to an image file to send along with the question.",
-          },
+          required: ["question"],
         },
-        required: ["question"],
       },
-    },
-  ],
-}));
+    ],
+  }));
 
-server.setRequestHandler(CallToolRequestSchema, async (request) => {
-  if (request.params.name !== "request_human_input") {
-    return {
-      content: [{ type: "text", text: `Unknown tool: ${request.params.name}` }],
-      isError: true,
+  server.setRequestHandler(CallToolRequestSchema, async (request) => {
+    if (request.params.name !== "request_human_input") {
+      return {
+        content: [{ type: "text", text: `Unknown tool: ${request.params.name}` }],
+        isError: true,
+      };
+    }
+
+    const args = request.params.arguments as {
+      question?: unknown;
+      image_path?: unknown;
     };
+
+    if (!args.question || typeof args.question !== "string") {
+      return {
+        content: [{ type: "text", text: "question (string) argument is required" }],
+        isError: true,
+      };
+    }
+
+    const image_path =
+      typeof args.image_path === "string" ? args.image_path : undefined;
+
+    try {
+      const answer = await requestHumanInput(args.question, image_path);
+      return {
+        content: [{ type: "text", text: answer }],
+      };
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return {
+        content: [{ type: "text", text: `Error: ${msg}` }],
+        isError: true,
+      };
+    }
+  });
+
+  async function main() {
+    const transport = new StdioServerTransport();
+    await server.connect(transport);
+    process.stderr.write(
+      `[meatbag-mcp] Server running on stdio (service: ${SERVICE_URL})\n`
+    );
   }
 
-  const args = request.params.arguments as {
-    question?: unknown;
-    image_path?: unknown;
-  };
-
-  if (!args.question || typeof args.question !== "string") {
-    return {
-      content: [{ type: "text", text: "question (string) argument is required" }],
-      isError: true,
-    };
-  }
-
-  const image_path =
-    typeof args.image_path === "string" ? args.image_path : undefined;
-
-  try {
-    const answer = await requestHumanInput(args.question, image_path);
-    return {
-      content: [{ type: "text", text: answer }],
-    };
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    return {
-      content: [{ type: "text", text: `Error: ${msg}` }],
-      isError: true,
-    };
-  }
-});
-
-// ── Start ─────────────────────────────────────────────────────────────────────
-
-async function main() {
-  const transport = new StdioServerTransport();
-  await server.connect(transport);
-  process.stderr.write(
-    `[meatbag-mcp] Server running on stdio (service: ${SERVICE_URL})\n`
-  );
+  main().catch((err) => {
+    process.stderr.write(
+      `[meatbag-mcp] Fatal: ${err instanceof Error ? err.message : String(err)}\n`
+    );
+    process.exit(1);
+  });
 }
-
-main().catch((err) => {
-  process.stderr.write(
-    `[meatbag-mcp] Fatal: ${err instanceof Error ? err.message : String(err)}\n`
-  );
-  process.exit(1);
-});

@@ -1,4 +1,4 @@
-# PLAN: sequential question queue in meatbag-service
+# PLAN: write tests for all API endpoints and controllers
 
 ## Task Restatement
 Modify `service.ts` so that only one Telegram message is visible (unanswered) at a time.
