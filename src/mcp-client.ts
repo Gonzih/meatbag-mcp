@@ -1,29 +1,21 @@
 /**
- * mcp-client — pure HTTP client for meatbag-service
- *
- * Contains only the service-communication logic used by meatbag-mcp.
- * No MCP SDK imports, no stdio, no process.exit — safe to import in tests.
+ * meatbag-mcp client library — HTTP calls to meatbag-service.
+ * All functions are parameterized (no module-level env var reads) for testability.
  */
-
-// ── Config ───────────────────────────────────────────────────────────────────
-
-export const SERVICE_URL = process.env.MEATBAG_SERVICE_URL ?? "http://localhost:7702";
-export const POLL_INTERVAL_MS = 2_000;
-export const MAX_WAIT_MS = 5 * 60 * 1_000; // 5 minutes total
-
-// ── Service client ────────────────────────────────────────────────────────────
 
 /**
- * Submit a question to meatbag-service and return the assigned request_id.
- * Throws if the service is unreachable or returns an error response.
+ * POSTs a question to the service and returns the assigned request_id.
+ *
+ * @throws if the service is unreachable or returns a non-OK status.
  */
 export async function postRequest(
+  serviceUrl: string,
   question: string,
   image_path?: string
 ): Promise<string> {
   let res: Response;
   try {
-    res = await fetch(`${SERVICE_URL}/request`, {
+    res = await fetch(`${serviceUrl}/request`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ question, image_path }),
@@ -32,14 +24,14 @@ export async function postRequest(
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     throw new Error(
-      `meatbag-service is not running on ${SERVICE_URL}: ${msg}\n` +
+      `meatbag-service is not running on ${serviceUrl}: ${msg}\n` +
         `Start it with: MEATBAG_BOT_TOKEN=<token> MEATBAG_CHAT_ID=<id> meatbag-service`
     );
   }
 
   if (!res.ok) {
     const body = await res.text();
-    throw new Error(`POST ${SERVICE_URL}/request failed (${res.status}): ${body}`);
+    throw new Error(`POST ${serviceUrl}/request failed (${res.status}): ${body}`);
   }
 
   const data = (await res.json()) as { request_id?: string; error?: string };
@@ -50,22 +42,31 @@ export async function postRequest(
 }
 
 /**
- * Long-poll meatbag-service for an answer to the given request_id.
- * Retries until an answer arrives or MAX_WAIT_MS elapses.
- * Throws on network errors, non-ok HTTP responses, or timeout.
+ * Long-polls GET /response/:id until an answer arrives or the deadline is exceeded.
+ *
+ * @param serviceUrl      Base URL of meatbag-service
+ * @param requestId       ID returned by postRequest
+ * @param maxWaitMs       Total wait budget (default: 5 minutes)
+ * @param pollIntervalMs  Delay between retries when server returns empty (default: 2 s)
  */
-export async function pollResponse(requestId: string): Promise<string> {
-  const deadline = Date.now() + MAX_WAIT_MS;
+export async function pollResponse(
+  serviceUrl: string,
+  requestId: string,
+  maxWaitMs = 5 * 60 * 1_000,
+  pollIntervalMs = 2_000
+): Promise<string> {
+  const deadline = Date.now() + maxWaitMs;
 
   while (Date.now() < deadline) {
     let res: Response;
     try {
-      res = await fetch(`${SERVICE_URL}/response/${requestId}`, {
-        signal: AbortSignal.timeout(35_000), // 30s server long-poll + 5s buffer
+      // GET /response/:id long-polls for up to 30 s on the server side
+      res = await fetch(`${serviceUrl}/response/${requestId}`, {
+        signal: AbortSignal.timeout(35_000), // 30 s server long-poll + 5 s buffer
       });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      throw new Error(`GET ${SERVICE_URL}/response/${requestId} failed: ${msg}`);
+      throw new Error(`GET ${serviceUrl}/response/${requestId} failed: ${msg}`);
     }
 
     if (!res.ok) {
@@ -79,19 +80,20 @@ export async function pollResponse(requestId: string): Promise<string> {
     }
 
     // Server timed out with no answer — wait briefly and retry
-    await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
+    await new Promise((r) => setTimeout(r, pollIntervalMs));
   }
 
-  throw new Error("Timed out waiting for human response (5 minutes)");
+  throw new Error("Timed out waiting for human response");
 }
 
 /**
- * Convenience wrapper: submit question, then poll for the answer.
+ * Convenience: posts the question and polls until an answer arrives.
  */
 export async function requestHumanInput(
+  serviceUrl: string,
   question: string,
   image_path?: string
 ): Promise<string> {
-  const requestId = await postRequest(question, image_path);
-  return pollResponse(requestId);
+  const requestId = await postRequest(serviceUrl, question, image_path);
+  return pollResponse(serviceUrl, requestId);
 }

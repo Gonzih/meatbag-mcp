@@ -1,28 +1,9 @@
-/**
- * service-core — pure business logic for meatbag-service
- *
- * No env-var reads, no server startup, no Telegram credentials.
- * All Telegram I/O is injected via TelegramSender so tests can mock it.
- */
-
 import { IncomingMessage, ServerResponse } from "http";
 import { randomUUID } from "crypto";
+import { readBody, sendJson } from "./http-utils";
+import { formatTelegramText } from "./tg-utils";
 
-// ── Telegram types ───────────────────────────────────────────────────────────
-
-export interface TgMessage {
-  message_id: number;
-  chat: { id: number };
-  text?: string;
-  caption?: string;
-}
-
-export interface TgUpdate {
-  update_id: number;
-  message?: TgMessage;
-}
-
-// ── Request store types ───────────────────────────────────────────────────────
+// ── Types ─────────────────────────────────────────────────────────────────────
 
 export interface RequestEntry {
   id: string;
@@ -30,30 +11,27 @@ export interface RequestEntry {
   image_path?: string;
   context?: string;
   answer?: string;
-  /** Set when Telegram send failed — waiters receive null */
+  /** Set if the Telegram send failed — waiters receive null */
   failReason?: string;
-  /** Callbacks registered by GET /response/:id long-pollers. null = failure. */
+  /** Callbacks waiting on GET /response/:id. null answer signals failure. */
   waiters: Array<(answer: string | null) => void>;
 }
 
-// ── Telegram sender interface (injected) ─────────────────────────────────────
-
-export interface TelegramSender {
-  sendMessage(text: string): Promise<void>;
-  sendPhoto(imagePath: string, caption: string): Promise<void>;
-}
-
-// ── Service state ─────────────────────────────────────────────────────────────
+/**
+ * Injectable Telegram send function — receives the entry and the formatted text.
+ * Throw to signal a send failure.
+ */
+export type TgSendFn = (entry: RequestEntry, tgText: string) => Promise<void>;
 
 export interface ServiceState {
-  /** All tracked requests, keyed by UUID */
-  requests: Map<string, RequestEntry>;
-  /** FIFO queue of request IDs whose Telegram message has NOT been sent yet */
-  sendQueue: string[];
-  /** The request currently shown in Telegram. null when idle. */
+  readonly requests: Map<string, RequestEntry>;
+  readonly sendQueue: string[];
   activeRequestId: string | null;
 }
 
+// ── Factory helpers ───────────────────────────────────────────────────────────
+
+/** Returns a fresh, empty service state. */
 export function createServiceState(): ServiceState {
   return {
     requests: new Map(),
@@ -62,89 +40,71 @@ export function createServiceState(): ServiceState {
   };
 }
 
-// ── HTTP utilities ────────────────────────────────────────────────────────────
-
-export function readBody(req: IncomingMessage): Promise<string> {
-  return new Promise((resolve, reject) => {
-    let body = "";
-    req.on("data", (chunk) => (body += chunk));
-    req.on("end", () => resolve(body));
-    req.on("error", reject);
-  });
-}
-
-export function sendJson(res: ServerResponse, status: number, data: unknown): void {
-  if (res.destroyed || res.writableEnded) return;
-  const body = JSON.stringify(data);
-  res.writeHead(status, { "Content-Type": "application/json" });
-  res.end(body);
-}
-
-// ── Queue dispatcher ──────────────────────────────────────────────────────────
-
 /**
- * Sends the next queued request to Telegram if no request is currently active.
- * Idempotent and re-entrant-safe: returns immediately when activeRequestId is set
- * (the check and the assignment both happen before any await).
+ * Returns a `processQueue` function bound to the given state, TG sender, and logger.
+ *
+ * processQueue is idempotent: safe to call concurrently.
+ * It claims `state.activeRequestId` **before** the first `await` to prevent
+ * multiple concurrent callers from sending the same request.
  */
-export async function processQueue(state: ServiceState, tg: TelegramSender): Promise<void> {
-  if (state.activeRequestId !== null) return;
-  if (state.sendQueue.length === 0) return;
+export function createProcessQueue(
+  state: ServiceState,
+  tgSend: TgSendFn,
+  log: (msg: string) => void
+): () => Promise<void> {
+  const processQueue = async (): Promise<void> => {
+    // Another request is already active — wait for its reply before sending next
+    if (state.activeRequestId !== null) return;
+    if (state.sendQueue.length === 0) return;
 
-  const id = state.sendQueue.shift()!;
-  const entry = state.requests.get(id);
-  if (!entry) {
-    // Entry removed (shouldn't happen in normal flow) — try next
-    void processQueue(state, tg);
-    return;
-  }
-
-  // Claim the active slot before any await to prevent concurrent sends
-  state.activeRequestId = id;
-
-  let tgText = entry.question;
-  if (entry.context) tgText = `[Context: ${entry.context}]\n\n${entry.question}`;
-
-  try {
-    if (entry.image_path) {
-      await tg.sendPhoto(entry.image_path, tgText);
-    } else {
-      await tg.sendMessage(tgText);
+    const id = state.sendQueue.shift()!;
+    const entry = state.requests.get(id);
+    if (!entry) {
+      // Entry was removed (shouldn't happen normally) — try next
+      void processQueue();
+      return;
     }
-    process.stderr.write(`[meatbag-service] Sent to Telegram: ${id}\n`);
-  } catch (tgErr) {
-    // Send failed — release slot and notify waiters
-    state.activeRequestId = null;
-    const msg = tgErr instanceof Error ? tgErr.message : String(tgErr);
-    process.stderr.write(`[meatbag-service] Telegram send failed for ${id}: ${msg}\n`);
-    entry.failReason = msg;
-    for (const waiter of entry.waiters) waiter(null);
-    entry.waiters = [];
-    void processQueue(state, tg);
-  }
+
+    // Claim the active slot before any await to prevent concurrent sends
+    state.activeRequestId = id;
+
+    const tgText = formatTelegramText(entry.question, entry.context);
+
+    try {
+      await tgSend(entry, tgText);
+      log(`Sent to Telegram: ${id}`);
+    } catch (tgErr) {
+      // Send failed — release the active slot and notify waiters of the error
+      state.activeRequestId = null;
+      const msg = tgErr instanceof Error ? tgErr.message : String(tgErr);
+      log(`Telegram send failed for ${id}: ${msg}`);
+      entry.failReason = msg;
+      for (const waiter of entry.waiters) waiter(null);
+      entry.waiters = [];
+      // Try to send the next queued request
+      void processQueue();
+    }
+  };
+  return processQueue;
 }
-
-// ── HTTP handler options ──────────────────────────────────────────────────────
-
-export interface HttpHandlerOptions {
-  /** How long GET /response/:id holds the connection before returning {}. Default 30s. */
-  longPollTimeoutMs?: number;
-}
-
-// ── HTTP handler factory ──────────────────────────────────────────────────────
 
 /**
- * Returns the HTTP request handler for meatbag-service.
- * All Telegram I/O is routed through the injected `tg` sender.
+ * Returns an async HTTP handler function (compatible with http.createServer).
+ *
+ * @param state         Shared service state
+ * @param processQueue  Queue dispatcher (result of createProcessQueue)
+ * @param log           Logger function
+ * @param opts.longPollTimeoutMs  How long GET /response/:id holds the connection (default 30 000)
  */
 export function createHttpHandler(
   state: ServiceState,
-  tg: TelegramSender,
-  options: HttpHandlerOptions = {}
+  processQueue: () => Promise<void>,
+  log: (msg: string) => void,
+  opts: { longPollTimeoutMs?: number } = {}
 ): (req: IncomingMessage, res: ServerResponse) => Promise<void> {
-  const { longPollTimeoutMs = 30_000 } = options;
+  const longPollTimeoutMs = opts.longPollTimeoutMs ?? 30_000;
 
-  return async (req, res) => {
+  return async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
     const url = req.url ?? "/";
     const method = req.method ?? "GET";
 
@@ -187,12 +147,11 @@ export function createHttpHandler(
         state.requests.set(id, entry);
         state.sendQueue.push(id);
 
-        process.stderr.write(
-          `[meatbag-service] Request queued: ${id} (queue depth: ${state.sendQueue.length})\n`
-        );
+        log(`Request queued: ${id} (queue depth: ${state.sendQueue.length})`);
         sendJson(res, 200, { request_id: id });
 
-        void processQueue(state, tg);
+        // Kick the dispatcher — sends immediately if no request is currently active
+        void processQueue();
         return;
       }
 
@@ -218,7 +177,7 @@ export function createHttpHandler(
           return;
         }
 
-        // Long-poll: hold connection until answer arrives or timeout
+        // Long-poll: hold connection until answer arrives or timeout elapses
         await new Promise<void>((resolve) => {
           const timer = setTimeout(() => {
             const idx = entry.waiters.indexOf(handler);
@@ -246,7 +205,7 @@ export function createHttpHandler(
       sendJson(res, 404, { error: "not found" });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      process.stderr.write(`[meatbag-service] Request handler error: ${msg}\n`);
+      log(`Request handler error: ${msg}`);
       sendJson(res, 500, { error: msg });
     }
   };
