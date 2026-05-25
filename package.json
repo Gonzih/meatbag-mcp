@@ -10,7 +10,8 @@
   "scripts": {
     "build": "tsc",
     "dev:mcp": "ts-node src/mcp.ts",
-    "dev:service": "ts-node src/service.ts"
+    "dev:service": "ts-node src/service.ts",
+    "test": "jest"
   },
   "keywords": [
     "mcp",
@@ -25,7 +26,10 @@
     "@modelcontextprotocol/sdk": "1.29.0"
   },
   "devDependencies": {
+    "@types/jest": "29.5.14",
     "@types/node": "22.15.21",
+    "jest": "29.7.0",
+    "ts-jest": "29.2.5",
     "typescript": "5.8.3"
   },
   "engines": {
@@ -36,5 +40,15 @@
   ],
   "publishConfig": {
     "access": "public"
+  },
+  "jest": {
+    "preset": "ts-jest",
+    "testEnvironment": "node",
+    "testMatch": [
+      "**/src/__tests__/**/*.test.ts"
+    ],
+    "moduleNameMapper": {
+      "^(.+)\\.js$": "$1"
+    }
   }
 }

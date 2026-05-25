@@ -1,51 +1,33 @@
-# PLAN: sequential question queue in meatbag-service
+# PLAN: Write tests for uncovered business logic
 
-## Task Restatement
-Modify `service.ts` so that only one Telegram message is visible (unanswered) at a time.
-When a second `POST /request` arrives while the first is still awaiting a reply, defer
-sending the second Telegram message until the first is answered. Queue drains FIFO.
-`mcp.ts` and the HTTP API surface must not change.
+## Task restatement
+Add comprehensive unit and integration tests for all core business logic in
+`src/service.ts` and `src/mcp.ts`. Zero tests currently exist. Cover all major
+code paths, conditional branches, and service interactions.
 
-## Current Behavior
-- `POST /request` sends Telegram message immediately and pushes to `pendingQueue`
-- Multiple requests → multiple visible Telegram questions simultaneously
-- User has no idea which question their reply addresses
+## Approach: minimal refactor + jest integration
 
-## Required Behavior
-- Only the "active" request is visible in Telegram at any time
-- New requests enqueue in `sendQueue`; Telegram message is deferred until active slot is free
-- On Telegram reply → mark active answered, pop next from `sendQueue`, send it
+1. Export testable functions from both source files.
+2. Guard side-effectful startup code with `if (require.main === module)`.
+3. Add a `_state` export object + `_resetState()` to `service.ts` so tests can
+   inspect and reset in-memory queue state between cases.
+4. Extract the anonymous HTTP callback to a named `httpHandler` export so
+   integration tests can spin up isolated servers on random ports.
+5. Use `jest` + `ts-jest` for the test runner.
+6. Mock `global.fetch` for Telegram API calls in unit tests.
+7. Use Node's built-in `http` module (not global `fetch`) as the HTTP client
+   inside integration tests — avoids conflicts with Telegram `fetch` mocks.
 
-## Approach
-
-### A: Single active slot + send queue (chosen)
-- `sendQueue: string[]` — requests waiting to be sent to Telegram
-- `activeRequestId: string | null` — the one request currently shown in Telegram
-- `processQueue()` — idempotent dispatcher: sends next from `sendQueue` if slot is free
-- Called on: new request arrives, Telegram reply received, Telegram send error
-
-**Pros:** minimal state, correct FIFO, no changes to HTTP surface
-**Cons:** none significant
-
-### B: Re-use pendingQueue with a "sent" flag per entry
-- Add `sent: boolean` to RequestEntry; only send when previous entry.sent becomes answered
-- Messier: requires scanning queue rather than O(1) slot check
-
-**Chosen: A** — cleaner, minimal diff
-
-## Files to Touch
-- `src/service.ts` — only file that changes
-
-## Key Design Decisions
-- `waiters` type: `(answer: string | null) => void` — `null` signals Telegram send failure
-- `failReason?: string` on RequestEntry — so `GET /response/:id` can return a 502
-- `processQueue()` is always called with `void` (fire-and-forget); it guards re-entrancy
-  via `activeRequestId !== null` check
-- `GET /health` updated to show `{ queued, active }` instead of `{ pending }`
-- Remove old `pendingQueue` completely (replaced by `sendQueue` + `activeRequestId`)
+## Files to touch
+- `package.json` — add jest/ts-jest/@types/jest devDeps + `test` script + jest config
+- `src/service.ts` — export functions, `_state`, `_resetState`, `httpHandler`; guard startup
+- `src/mcp.ts` — export `postRequest`, `pollResponse`, `requestHumanInput`; guard MCP server startup
+- `src/__tests__/service.test.ts` — new
+- `src/__tests__/mcp.test.ts` — new
 
 ## Risks
-- `processQueue` called concurrently: safe because it returns early if `activeRequestId !== null`
-  and `sendQueue.shift()` is synchronous (no race before await)
-- Telegram send takes time: `activeRequestId` is set before the await, so concurrent
-  `processQueue` calls return early correctly
+- `.js` extension imports from `@modelcontextprotocol/sdk` may not resolve in
+  ts-jest CJS env → mitigated by mocking the SDK entirely in `mcp.test.ts`
+- `void processQueue()` fire-and-forget calls need microtask draining in tests
+  → use `await Promise.resolve()` loops
+- `processQueue` calls itself recursively on failure → flush event loop with setImmediate
