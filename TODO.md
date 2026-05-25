@@ -1,17 +1,26 @@
-# TODO: sequential question queue
+# TODO: test uncovered utility functions
 
-- [ ] Create branch feat/sequential-queue
-- [ ] Update service.ts: replace pendingQueue with sendQueue + activeRequestId
-- [ ] Update service.ts: add processQueue() dispatcher
-- [ ] Update service.ts: POST /request defers Telegram send, calls processQueue()
-- [ ] Update service.ts: pollLoop resolves activeRequestId, calls processQueue()
-- [ ] Update service.ts: GET /response/:id handles failReason (502)
-- [ ] Update service.ts: GET /health shows queued/active
-- [ ] npm run build — verify passes
+- [ ] Install jest, ts-jest, @types/jest
+- [ ] Create jest.config.js
+- [ ] Create tsconfig.test.json
+- [ ] Update package.json (add test script, devDeps)
+- [ ] Update tsconfig.json (exclude __tests__ from production build)
+- [ ] Create src/http-utils.ts (readBody, sendJson)
+- [ ] Create src/tg-utils.ts (getMimeType, formatTelegramText)
+- [ ] Create src/tg-api.ts (tgSendMessage, tgSendPhoto, tgGetUpdates, TgMessage, TgUpdate)
+- [ ] Create src/service-core.ts (RequestEntry, ServiceState, createProcessQueue, createHttpHandler)
+- [ ] Create src/mcp-client.ts (postRequest, pollResponse, requestHumanInput)
+- [ ] Update src/service.ts to import from extracted modules
+- [ ] Update src/mcp.ts to import mcp-client functions
+- [ ] Write src/__tests__/http-utils.test.ts
+- [ ] Write src/__tests__/tg-utils.test.ts
+- [ ] Write src/__tests__/tg-api.test.ts
+- [ ] Write src/__tests__/service-core.test.ts
+- [ ] Write src/__tests__/mcp-client.test.ts
+- [ ] npm test — all tests pass
+- [ ] npm run build — production build passes
 - [ ] git diff --staged review
 - [ ] git commit
-- [ ] git push -u origin feat/sequential-queue
-- [ ] npm version patch
-- [ ] npm publish --access public
+- [ ] git push -u origin feat/test-utilities
 - [ ] gh pr create
 - [ ] gh pr merge --squash --auto

@@ -1,51 +1,78 @@
-# PLAN: sequential question queue in meatbag-service
+# PLAN: Test uncovered utility functions and helpers
 
 ## Task Restatement
-Modify `service.ts` so that only one Telegram message is visible (unanswered) at a time.
-When a second `POST /request` arrives while the first is still awaiting a reply, defer
-sending the second Telegram message until the first is answered. Queue drains FIFO.
-`mcp.ts` and the HTTP API surface must not change.
+Identify all utility, helper, and standalone functions in the codebase that lack test coverage.
+Extract them into separately-importable modules (minimum necessary restructuring), install a
+test framework, and write comprehensive unit tests targeting 95%+ coverage for each utility module.
 
-## Current Behavior
-- `POST /request` sends Telegram message immediately and pushes to `pendingQueue`
-- Multiple requests → multiple visible Telegram questions simultaneously
-- User has no idea which question their reply addresses
+## Functions to Cover
 
-## Required Behavior
-- Only the "active" request is visible in Telegram at any time
-- New requests enqueue in `sendQueue`; Telegram message is deferred until active slot is free
-- On Telegram reply → mark active answered, pop next from `sendQueue`, send it
+### From src/service.ts (currently untestable — no exports, module-level side effects)
+- `readBody(req)` — HTTP stream body reader
+- `sendJson(res, status, data)` — JSON response writer
+- MIME type mapping (inline in tgSendPhoto)
+- `formatTelegramText(question, context?)` — builds Telegram message text
+- `tgSendMessage`, `tgSendPhoto`, `tgGetUpdates` — Telegram API wrappers
+- `processQueue()` — FIFO queue dispatcher (core business logic)
+- HTTP handler logic: GET /health, POST /request, GET /response/:id
+
+### From src/mcp.ts (currently untestable — module-level main() call)
+- `postRequest(serviceUrl, question, image_path?)` — POST to service
+- `pollResponse(serviceUrl, requestId, opts?)` — long-poll for answer
+- `requestHumanInput(serviceUrl, question, image_path?)` — composite
 
 ## Approach
 
-### A: Single active slot + send queue (chosen)
-- `sendQueue: string[]` — requests waiting to be sent to Telegram
-- `activeRequestId: string | null` — the one request currently shown in Telegram
-- `processQueue()` — idempotent dispatcher: sends next from `sendQueue` if slot is free
-- Called on: new request arrives, Telegram reply received, Telegram send error
+### A: Extract utility modules (chosen)
+- `src/http-utils.ts` — readBody, sendJson (no external deps)
+- `src/tg-utils.ts` — getMimeType, formatTelegramText (pure)
+- `src/tg-api.ts` — tgSendMessage, tgSendPhoto, tgGetUpdates (parameterized, fetch-mockable)
+- `src/service-core.ts` — RequestEntry type, ServiceState, createProcessQueue, createHttpHandler
+- `src/mcp-client.ts` — postRequest, pollResponse, requestHumanInput
+- service.ts and mcp.ts become thin wrappers importing from these modules
+- Tests import extracted modules directly
 
-**Pros:** minimal state, correct FIFO, no changes to HTTP surface
-**Cons:** none significant
+**Pros:** Clean separation, 100% testable, no process.exit or server.listen in test scope
+**Cons:** Minor refactor needed to service.ts and mcp.ts (low risk)
 
-### B: Re-use pendingQueue with a "sent" flag per entry
-- Add `sent: boolean` to RequestEntry; only send when previous entry.sent becomes answered
-- Messier: requires scanning queue rather than O(1) slot check
+### B: Mock module-level side effects with jest.mock
+- Mock process.exit, global.fetch, http.createServer, etc. at test time
+- Import service.ts and mcp.ts directly
+**Cons:** Fragile, hard to reset state between tests, pollLoop runs as side effect
 
-**Chosen: A** — cleaner, minimal diff
+### C: Subprocess integration tests
+- Spawn the actual service process, make HTTP requests, kill it
+**Cons:** Slow, flaky, no coverage for fine-grained units
+
+**Chosen: A** — cleanest, most maintainable, good isolation
 
 ## Files to Touch
-- `src/service.ts` — only file that changes
 
-## Key Design Decisions
-- `waiters` type: `(answer: string | null) => void` — `null` signals Telegram send failure
-- `failReason?: string` on RequestEntry — so `GET /response/:id` can return a 502
-- `processQueue()` is always called with `void` (fire-and-forget); it guards re-entrancy
-  via `activeRequestId !== null` check
-- `GET /health` updated to show `{ queued, active }` instead of `{ pending }`
-- Remove old `pendingQueue` completely (replaced by `sendQueue` + `activeRequestId`)
+New source modules:
+- `src/http-utils.ts`
+- `src/tg-utils.ts`
+- `src/tg-api.ts`
+- `src/service-core.ts`
+- `src/mcp-client.ts`
+
+Modified:
+- `src/service.ts` — import from extracted modules
+- `src/mcp.ts` — import from mcp-client.ts
+- `package.json` — add jest, ts-jest, @types/jest, test script
+- `tsconfig.json` — exclude __tests__ from production build
+
+New config:
+- `jest.config.js`
+- `tsconfig.test.json` — extends tsconfig, includes __tests__
+
+New tests:
+- `src/__tests__/http-utils.test.ts`
+- `src/__tests__/tg-utils.test.ts`
+- `src/__tests__/tg-api.test.ts`
+- `src/__tests__/service-core.test.ts`
+- `src/__tests__/mcp-client.test.ts`
 
 ## Risks
-- `processQueue` called concurrently: safe because it returns early if `activeRequestId !== null`
-  and `sendQueue.shift()` is synchronous (no race before await)
-- Telegram send takes time: `activeRequestId` is set before the await, so concurrent
-  `processQueue` calls return early correctly
+- service.ts refactor must preserve identical runtime behavior
+- processQueue re-entrancy guard must still work (set activeRequestId before await)
+- Long-poll timeout tests need configurable timeout or fake timers — use configurable param
