@@ -787,3 +787,110 @@ describe("Sequential queue behavior", () => {
     expect(state.activeRequestId).toBe("req-1"); // slot stays after send
   });
 });
+
+// ── Error coverage: catch block + fallback branches ───────────────────────────
+//
+// These tests call the handler function directly (without withTestServer) so we
+// can control the request stream and trigger the internal catch block.
+
+import { EventEmitter } from "node:events";
+
+function makeMockRes() {
+  const res = {
+    destroyed: false,
+    writableEnded: false,
+    _status: 0,
+    _body: "",
+    writeHead: vi.fn(function (this: typeof res, status: number) {
+      this._status = status;
+    }),
+    end: vi.fn(function (this: typeof res, body: string) {
+      this._body = body;
+      this.writableEnded = true;
+    }),
+  };
+  // bind `this` so the vi.fn() lambdas see the correct object
+  res.writeHead = res.writeHead.bind(res) as typeof res.writeHead;
+  res.end = res.end.bind(res) as typeof res.end;
+  return res;
+}
+
+describe("createHttpHandler — internal catch block", () => {
+  it("returns 500 when readBody throws an Error", async () => {
+    const state = createServiceState();
+    const handler = createHttpHandler(state, mockTg());
+
+    const req = new EventEmitter() as any;
+    req.method = "POST";
+    req.url = "/request";
+
+    const res = makeMockRes();
+    const handlerPromise = handler(req, res as any);
+
+    // Emit an Error on the request stream → readBody rejects
+    process.nextTick(() => req.emit("error", new Error("socket hang up")));
+    await handlerPromise;
+
+    expect(res._status).toBe(500);
+    expect(JSON.parse(res._body).error).toMatch(/socket hang up/);
+  });
+
+  it("returns 500 when readBody throws a non-Error value (covers String(err) branch)", async () => {
+    const state = createServiceState();
+    const handler = createHttpHandler(state, mockTg());
+
+    const req = new EventEmitter() as any;
+    req.method = "POST";
+    req.url = "/request";
+
+    const res = makeMockRes();
+    const handlerPromise = handler(req, res as any);
+
+    // Emit a non-Error to exercise the String(err) branch
+    process.nextTick(() => req.emit("error", "raw string rejection"));
+    await handlerPromise;
+
+    expect(res._status).toBe(500);
+    expect(JSON.parse(res._body).error).toBe("raw string rejection");
+  });
+});
+
+describe("createHttpHandler — null waiter without failReason", () => {
+  it("returns '502 Telegram error: send failed' when failReason is not set", async () => {
+    const state = createServiceState();
+    const entry: RequestEntry = { id: "req-1", question: "Q?", waiters: [] };
+    state.requests.set("req-1", entry);
+    const { port, close } = await withTestServer(state, mockTg(), {
+      longPollTimeoutMs: 5_000,
+    });
+    try {
+      const pollPromise = getJson(port, "/response/req-1");
+      await tick(50);
+      // Call waiter with null but intentionally leave failReason unset
+      // so the fallback ?? "send failed" is used
+      entry.waiters[0](null);
+      const { status, body } = await pollPromise;
+      expect(status).toBe(502);
+      expect((body as { error: string }).error).toContain("send failed");
+    } finally {
+      await close();
+    }
+  });
+});
+
+describe("processQueue — non-Error Telegram failure", () => {
+  it("sets failReason via String(err) when tg.sendMessage rejects with non-Error", async () => {
+    const state = createServiceState();
+    const entry: RequestEntry = { id: "req-1", question: "Q?", waiters: [] };
+    state.requests.set("req-1", entry);
+    state.sendQueue.push("req-1");
+
+    const tg = mockTg({
+      sendMessage: vi.fn().mockRejectedValue("raw rejection"),
+    });
+    await processQueue(state, tg);
+
+    expect(entry.failReason).toBe("raw rejection");
+    expect(state.activeRequestId).toBeNull();
+  });
+});

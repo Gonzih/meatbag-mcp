@@ -25,7 +25,7 @@ const MAX_WAIT_MS = 5 * 60 * 1_000; // 5 minutes total
 
 // ── Service client ───────────────────────────────────────────────────────────
 
-async function postRequest(
+export async function postRequest(
   question: string,
   image_path?: string
 ): Promise<string> {
@@ -57,7 +57,7 @@ async function postRequest(
   return data.request_id;
 }
 
-async function pollResponse(requestId: string): Promise<string> {
+export async function pollResponse(requestId: string): Promise<string> {
   const deadline = Date.now() + MAX_WAIT_MS;
 
   while (Date.now() < deadline) {
@@ -89,7 +89,7 @@ async function pollResponse(requestId: string): Promise<string> {
   throw new Error("Timed out waiting for human response (5 minutes)");
 }
 
-async function requestHumanInput(
+export async function requestHumanInput(
   question: string,
   image_path?: string
 ): Promise<string> {
@@ -99,7 +99,7 @@ async function requestHumanInput(
 
 // ── MCP Server ────────────────────────────────────────────────────────────────
 
-const server = new Server(
+export const server = new Server(
   { name: "meatbag-mcp", version: "1.1.0" },
   { capabilities: { tools: {} } }
 );
@@ -170,7 +170,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
 // ── Start ─────────────────────────────────────────────────────────────────────
 
-async function main() {
+export async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
   process.stderr.write(
@@ -178,9 +178,13 @@ async function main() {
   );
 }
 
-main().catch((err) => {
-  process.stderr.write(
-    `[meatbag-mcp] Fatal: ${err instanceof Error ? err.message : String(err)}\n`
-  );
-  process.exit(1);
-});
+/* v8 ignore start */
+if (require.main === module) {
+  main().catch((err) => {
+    process.stderr.write(
+      `[meatbag-mcp] Fatal: ${err instanceof Error ? err.message : String(err)}\n`
+    );
+    process.exit(1);
+  });
+}
+/* v8 ignore stop */
