@@ -1,16 +1,10 @@
-# TODO: tests for service data-access layer
+# TODO: Coverage Audit
 
-- [x] Write PLAN.md and TODO.md
-- [ ] Create git branch feat/service-tests
-- [ ] npm install
-- [ ] Create src/service-core.ts (extracted logic with DI)
-- [ ] Refactor src/service.ts to import from service-core
-- [ ] Create src/service.test.ts (all test cases from plan)
-- [ ] Update package.json: add "test" script
-- [ ] npm run build — verify passes
-- [ ] npm test — verify all tests pass
-- [ ] git diff --staged review
-- [ ] git commit
-- [ ] git push -u origin feat/service-tests
-- [ ] gh pr create
-- [ ] gh pr merge --squash --auto
+- [x] Install jest, @types/jest, ts-jest
+- [x] Configure jest in package.json (preset, coverage, forceExit)
+- [x] Write src/__tests__/service.test.ts
+- [x] Write src/__tests__/mcp.test.ts
+- [x] Run npm test -- --coverage and capture output
+- [x] Write COVERAGE_REPORT.md with structured gap analysis
+- [ ] git add, diff --staged, commit
+- [ ] git push + gh pr create + gh pr merge
